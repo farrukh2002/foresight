@@ -1,0 +1,99 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo.toml version must match tag
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Cargo.toml version ($CARGO_VERSION) != tag ($TAG_VERSION)" >&2
+            exit 1
+          fi
+      - name: Determine channel
+        id: channel
+        run: |
+          CHANNEL="${GITHUB_REF_NAME##*-}"
+          case "$CHANNEL" in
+            stable|beta|dev) ;;
+            *)
+              echo "tag ${GITHUB_REF_NAME} must end in -stable, -beta, or -dev (got '$CHANNEL')" >&2
+              exit 1
+              ;;
+          esac
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: foresight-linux-x86_64.tar.gz
+          - target: aarch64-unknown-linux-musl
+            asset: foresight-linux-aarch64.tar.gz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/foresight dist/
+          tar -czf ${{ matrix.asset }} -C dist foresight
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Collect assets
+        run: |
+          mkdir -p out
+          find dist -name '*.tar.gz' -exec cp {} out/ \;
+          cd out
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "${GITHUB_REF_NAME}" > VERSION
+      - name: Publish versioned release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.tar.gz
+            out/SHA256SUMS
+            out/VERSION
+      - name: Publish floating channel pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CH="${{ needs.check-version.outputs.channel }}"
+          gh release delete "$CH" --yes --cleanup-tag --repo "${{ github.repository }}" || true
+          gh release create "$CH" out/*.tar.gz out/SHA256SUMS out/VERSION \
+            --repo "${{ github.repository }}" \
+            --title "$CH (latest)" \
+            --notes "Floating pointer to the latest $CH release (${GITHUB_REF_NAME}). Used by the self-updater to track this channel; download the versioned release instead for a link that won't move." \
+            --target "${{ github.sha }}"
