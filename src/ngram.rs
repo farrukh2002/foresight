@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::util::{expand_home, fnv1a64, now_secs};
+use crate::util::{expand_home, fnv1a64, is_path_shaped, now_secs};
 use crate::vocab::Vocab;
 
-const MAGIC: &[u8; 4] = b"BPM4";
+const MAGIC: &[u8; 4] = b"BPM5";
+const LEGACY_MAGIC4: &[u8; 4] = b"BPM4";
 const LEGACY_MAGIC: &[u8; 4] = b"BPM2";
 const LEGACY_MAGIC3: &[u8; 4] = b"BPM3";
 
@@ -14,6 +15,13 @@ const HALF_LIFE_DAYS: f64 = 14.0;
 const CWD_BONUS: f64 = 2.0;
 const CONTEXT_WEIGHT: f64 = 8.0;
 const SEQ_BONUS: f64 = 8.0;
+const CHAIN_MAX_WORDS: usize = 3;
+const MIN_BIGRAM_HITS: u32 = 3;
+const B_MIN_P: f64 = 0.40;
+const B_MIN_MARGIN: f64 = 1.5;
+const T_MIN_P: f64 = 0.25;
+const CHAIN_MIN_MARGIN: f64 = 1.5;
+const SEQ_WORD_BONUS: f64 = 0.5;
 
 pub fn line_shape(text: &str) -> u64 {
     let mut toks = text.split_whitespace();
@@ -37,6 +45,7 @@ pub fn recency_weight(last_used: u64, now: u64) -> f64 {
 pub struct LineEntry {
     pub text: String,
     pub count: u32,
+    pub weight: f64,
     pub last_used: u64,
     pub cwd_counts: HashMap<String, u32>,
     pub shape: u64,
@@ -77,6 +86,7 @@ impl Model {
 
         if let Some(&idx) = self.line_index.get(line) {
             let entry = &mut self.lines[idx];
+            entry.weight = entry.weight * recency_weight(entry.last_used, now) + 1.0;
             entry.count += 1;
             entry.last_used = now;
             if !cwd.is_empty() {
@@ -92,7 +102,7 @@ impl Model {
             let pos = self.sorted_line_ids.partition_point(|&i| self.lines[i as usize].text.as_str() < line);
             self.sorted_line_ids.insert(pos, idx as u32);
             let shape = line_shape(line);
-            self.lines.push(LineEntry { text: line.to_string(), count: 1, last_used: now, cwd_counts, shape });
+            self.lines.push(LineEntry { text: line.to_string(), count: 1, weight: 1.0, last_used: now, cwd_counts, shape });
         }
 
         let raw_tokens: Vec<&str> = line.split_whitespace().collect();
@@ -168,8 +178,10 @@ impl Model {
         let text = self.lines[idx].text.clone();
         self.add_line_votes(&text, -1);
         self.lines[idx].count = self.lines[idx].count.saturating_sub(1);
+        self.lines[idx].weight = (self.lines[idx].weight - 1.0).max(0.0);
         let result = self.predict_with(partial, cwd, now, true, prev_shape);
         self.lines[idx].count += 1;
+        self.lines[idx].weight += 1.0;
         self.add_line_votes(&text, 1);
         result
     }
@@ -193,17 +205,36 @@ impl Model {
 
         if ends_with_space || tokens.is_empty() {
             let ctx_ids: Vec<u32> = tokens.iter().filter_map(|w| self.vocab.get(w)).collect();
-            if let Some((tag, word_id)) = self.backoff_next_word(&ctx_ids) {
-                return (tag, self.vocab.text(word_id).to_string());
+            let boost = self.seq_boost_words(prev_shape, now);
+            if let Some((tag, word_id, prob, margin)) = self.backoff_next_word(&ctx_ids, boost.as_ref()) {
+                let gate_ok = match tag {
+                    'T' => prob >= T_MIN_P,
+                    'B' => prob >= B_MIN_P && margin >= B_MIN_MARGIN,
+                    _ => true,
+                };
+                if gate_ok {
+                    let first = self.vocab.text(word_id).to_string();
+                    if tag == 'T' {
+                        if let Some(chain) = self.chain_next_words(&ctx_ids, word_id, CHAIN_MAX_WORDS, boost.as_ref()) {
+                            return (tag, chain);
+                        }
+                    }
+                    return (tag, first);
+                }
             }
             return ('\0', String::new());
+        }
+
+        let prefix = tokens[tokens.len() - 1];
+        if is_path_shaped(prefix) {
+            if let Some(rest) = self.fs_complete_path(prefix, cwd, now) {
+                return ('F', rest);
+            }
         }
 
         if !allow_word_prefix {
             return ('\0', String::new());
         }
-
-        let prefix = tokens[tokens.len() - 1];
         let prev_id = if tokens.len() >= 2 { self.vocab.get(tokens[tokens.len() - 2]) } else { None };
         if let Some(best) = self.best_word_prefix(prefix, prev_id) {
             return ('W', best[prefix.len()..].to_string());
@@ -212,7 +243,7 @@ impl Model {
     }
 
     fn line_score(entry: &LineEntry, cwd: &str, now: u64, seq: f64) -> f64 {
-        let mut score = entry.count as f64 * recency_weight(entry.last_used, now);
+        let mut score = entry.weight * recency_weight(entry.last_used, now);
         if seq > 0.0 {
             score *= 1.0 + SEQ_BONUS * (seq / (1.0 + seq));
         }
@@ -245,7 +276,7 @@ impl Model {
         scored.into_iter().map(|(_, t)| t[partial.len()..].to_string()).collect()
     }
 
-    fn backoff_next_word(&self, ctx_ids: &[u32]) -> Option<(char, u32)> {
+    fn backoff_next_word(&self, ctx_ids: &[u32], boost: Option<&HashSet<u32>>) -> Option<(char, u32, f64, f64)> {
         let tri = if ctx_ids.len() >= 2 { self.trigram.get(&(ctx_ids[ctx_ids.len() - 2], ctx_ids[ctx_ids.len() - 1])) } else { None };
         let bi = ctx_ids.last().and_then(|&last| self.bigram.get(&last));
         if tri.is_none() && bi.is_none() {
@@ -266,23 +297,67 @@ impl Model {
 
         let uni_total = self.total_words.max(1) as f64;
         let mut best: Option<(f64, u32, char)> = None;
+        let mut runner_up = 0.0f64;
+        let mut total = 0.0f64;
         for &w in &candidates {
             let c3 = tri.map_or(0, |m| m.get(&w).copied().unwrap_or(0));
             let c2 = bi.map_or(0, |m| m.get(&w).copied().unwrap_or(0));
+            if c3 == 0 && c2 < MIN_BIGRAM_HITS {
+                continue;
+            }
             let uni = self.word_freq.get(w as usize).copied().unwrap_or(0);
-            let score = 0.6 * (if tri_total > 0 { c3 as f64 / tri_total as f64 } else { 0.0 })
+            let mut score = 0.6 * (if tri_total > 0 { c3 as f64 / tri_total as f64 } else { 0.0 })
                 + 0.3 * (if bi_total > 0 { c2 as f64 / bi_total as f64 } else { 0.0 })
                 + 0.1 * (uni as f64 / uni_total);
+            if boost.map_or(false, |b| b.contains(&w)) {
+                score *= 1.0 + SEQ_WORD_BONUS;
+            }
+            total += score;
             let tag = if c3 > 0 { 'T' } else { 'B' };
             let better = match best {
                 None => true,
                 Some((bs, _, _)) => score > bs,
             };
             if better {
+                if let Some((bs, _, _)) = best {
+                    runner_up = runner_up.max(bs);
+                }
                 best = Some((score, w, tag));
+            } else {
+                runner_up = runner_up.max(score);
             }
         }
-        best.map(|(_, w, tag)| (tag, w))
+        let (score, w, tag) = best?;
+        let prob = if total > 0.0 { score / total } else { 0.0 };
+        let margin = if runner_up > 0.0 { score / runner_up } else { f64::INFINITY };
+        Some((tag, w, prob, margin))
+    }
+
+    fn seq_boost_words(&self, prev_shape: Option<u64>, now: u64) -> Option<HashSet<u32>> {
+        let prev = prev_shape?;
+        let mut out = HashSet::new();
+        for entry in &self.lines {
+            if self.seq_strength(prev, entry.shape, now) > 0.0 {
+                out.extend(entry.text.split_whitespace().filter_map(|w| self.vocab.get(w)));
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    fn chain_next_words(&self, ctx_ids: &[u32], first: u32, max_words: usize, boost: Option<&HashSet<u32>>) -> Option<String> {
+        let mut ids: Vec<u32> = ctx_ids.to_vec();
+        ids.push(first);
+        let mut out = self.vocab.text(first).to_string();
+        for _ in 1..max_words {
+            let Some((tag, id, prob, margin)) = self.backoff_next_word(&ids, boost) else { break };
+            if tag != 'T' || prob < T_MIN_P || margin < CHAIN_MIN_MARGIN {
+                break;
+            }
+            out.push(' ');
+            out.push_str(self.vocab.text(id));
+            ids.push(id);
+        }
+        Some(out)
     }
 
     fn best_word_prefix(&self, prefix: &str, prev_id: Option<u32>) -> Option<String> {
@@ -314,10 +389,12 @@ impl Model {
         })
     }
 
-    pub fn touch_line(&mut self, line: &str, now: u64) -> bool {
+    pub fn accept_boost(&mut self, line: &str, now: u64) -> bool {
         match self.line_index.get(line) {
             Some(&i) => {
-                self.lines[i].last_used = now;
+                let entry = &mut self.lines[i];
+                entry.weight = entry.weight * recency_weight(entry.last_used, now) + 1.0;
+                entry.last_used = now;
                 true
             }
             None => false,
@@ -331,6 +408,45 @@ impl Model {
         }
     }
 
+    fn fs_complete_path(&self, token: &str, cwd: &str, now: u64) -> Option<String> {
+        let slash = token.rfind('/')?;
+        let dir_part = &token[..slash + 1];
+        let base = &token[slash + 1..];
+        if base.is_empty() || base.contains('*') || base.contains('?') {
+            return None;
+        }
+        let home = std::env::var("HOME").ok()?;
+        let dir = if dir_part == "/" {
+            Path::new("/").to_path_buf()
+        } else {
+            let resolved = expand_home(dir_part.trim_end_matches('/'), &home, Some(cwd))?;
+            Path::new(&resolved).to_path_buf()
+        };
+
+        let mut best: Option<(f64, String)> = None;
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(base) || name == base {
+                continue;
+            }
+            let is_dir = entry.file_type().map_or(false, |t| t.is_dir());
+            let full = dir.join(&name).to_string_lossy().to_string();
+            let score = self.path_score(&full, now) + if is_dir { 0.5 } else { 0.0 };
+            let better = match &best {
+                None => true,
+                Some((bs, bn)) => score > *bs || (score == *bs && name < *bn),
+            };
+            if better {
+                let mut rest = name[base.len()..].to_string();
+                if is_dir {
+                    rest.push('/');
+                }
+                best = Some((score, rest));
+            }
+        }
+        best.map(|(_, rest)| rest)
+    }
+
     pub fn explain(&self, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>) -> String {
         let mut parts = Vec::new();
         let conts = self.topk_line_continuations(partial, cwd, now, prev_shape, 3);
@@ -341,8 +457,10 @@ impl Model {
         }
         let tokens: Vec<&str> = partial.split_whitespace().collect();
         let ctx_ids: Vec<u32> = tokens.iter().filter_map(|w| self.vocab.get(w)).collect();
-        match self.backoff_next_word(&ctx_ids) {
-            Some((tag, id)) => parts.push(format!("{tag}: \"{}\"", self.vocab.text(id))),
+        match self.backoff_next_word(&ctx_ids, None) {
+            Some((tag, id, prob, margin)) => {
+                parts.push(format!("{tag}: \"{}\" (p={prob:.2} m={margin:.1})", self.vocab.text(id)))
+            }
             None => parts.push("T/B: none".to_string()),
         }
         if !partial.ends_with(' ') && !tokens.is_empty() {
@@ -386,14 +504,21 @@ impl Model {
         if out.is_empty() {
             let tokens: Vec<&str> = partial.split_whitespace().collect();
             let ctx_ids: Vec<u32> = tokens.iter().filter_map(|w| self.vocab.get(w)).collect();
-            if let Some((tag, id)) = self.backoff_next_word(&ctx_ids) {
+            if let Some((tag, id, _prob, _margin)) = self.backoff_next_word(&ctx_ids, None) {
                 out.push((tag, self.vocab.text(id).to_string()));
             }
             if !partial.ends_with(' ') && !tokens.is_empty() {
                 let prefix = tokens[tokens.len() - 1];
-                let prev_id = if tokens.len() >= 2 { self.vocab.get(tokens[tokens.len() - 2]) } else { None };
-                if let Some(w) = self.best_word_prefix(prefix, prev_id) {
-                    out.push(('W', w[prefix.len()..].to_string()));
+                if is_path_shaped(prefix) {
+                    if let Some(rest) = self.fs_complete_path(prefix, cwd, now) {
+                        out.push(('F', rest));
+                    }
+                }
+                if out.is_empty() {
+                    let prev_id = if tokens.len() >= 2 { self.vocab.get(tokens[tokens.len() - 2]) } else { None };
+                    if let Some(w) = self.best_word_prefix(prefix, prev_id) {
+                        out.push(('W', w[prefix.len()..].to_string()));
+                    }
                 }
             }
         }
@@ -477,6 +602,7 @@ impl Model {
         write_u32(&mut body, self.lines.len() as u32)?;
         for entry in &self.lines {
             write_u32(&mut body, entry.count)?;
+            write_f64(&mut body, entry.weight)?;
             write_u64(&mut body, entry.last_used)?;
             write_str_u16(&mut body, &entry.text)?;
             write_u32(&mut body, entry.cwd_counts.len() as u32)?;
@@ -517,10 +643,11 @@ impl Model {
         let mut raw = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4];
         raw.read_exact(&mut magic)?;
-        let (legacy2, has_seq) = match &magic {
-            MAGIC => (false, true),
-            LEGACY_MAGIC3 => (false, false),
-            LEGACY_MAGIC => (true, false),
+        let (legacy2, has_seq, has_weight) = match &magic {
+            MAGIC => (false, true, true),
+            LEGACY_MAGIC4 => (false, true, false),
+            LEGACY_MAGIC3 => (false, false, false),
+            LEGACY_MAGIC => (true, false, false),
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic")),
         };
         let legacy_now = std::fs::metadata(path).and_then(|m| m.modified()).map_or(now_secs(), |t| {
@@ -584,6 +711,7 @@ impl Model {
         let n_lines = read_u32(&mut r)?;
         for i in 0..n_lines {
             let count = read_u32(&mut r)?;
+            let weight = if has_weight { read_f64(&mut r)? } else { count as f64 };
             let last_used = if legacy2 { legacy_now } else { read_u64(&mut r)? };
             let text = read_str_u16(&mut r)?;
             let mut cwd_counts = HashMap::new();
@@ -597,7 +725,7 @@ impl Model {
             }
             let shape = line_shape(&text);
             model.line_index.insert(text.clone(), i as usize);
-            model.lines.push(LineEntry { text, count, last_used, cwd_counts, shape });
+            model.lines.push(LineEntry { text, count, weight, last_used, cwd_counts, shape });
         }
 
         let n_paths = read_u32(&mut r)?;
@@ -646,6 +774,9 @@ fn write_u64<W: Write>(w: &mut W, v: u64) -> io::Result<()> {
 fn write_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
+fn write_f64<W: Write>(w: &mut W, v: f64) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
 fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
@@ -655,6 +786,11 @@ fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
+}
+fn read_f64<R: Read>(r: &mut R) -> io::Result<f64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(f64::from_le_bytes(b))
 }
 fn read_str_u16<R: Read>(r: &mut R) -> io::Result<String> {
     let mut lb = [0u8; 2];
@@ -667,6 +803,133 @@ fn read_str_u16<R: Read>(r: &mut R) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn fs_completion_completes_file_and_dir() {
+        let dir = std::env::temp_dir().join(format!("fscomp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::File::create(dir.join("alpha.txt")).unwrap();
+        fs::File::create(dir.join("beta.log")).unwrap();
+        let m = Model::default();
+        let now = 10_000u64;
+        let d = dir.to_string_lossy().to_string();
+
+        let (tag, suffix) = m.predict_with(&format!("cat {d}/alp"), "", now, false, None);
+        assert_eq!((tag, suffix.as_str()), ('F', "ha.txt"), "file completion");
+
+        let (tag, suffix) = m.predict_with(&format!("ls {d}/nest"), "", now, false, None);
+        assert_eq!((tag, suffix.as_str()), ('F', "ed/"), "dir completes with slash");
+
+        let (tag, suffix) = m.predict_with("cat ./alp", &d, now, true, None);
+        assert_eq!((tag, suffix.as_str()), ('F', "ha.txt"), "relative completion");
+
+        let (tag, _) = m.predict_with(&format!("cat {d}/zzz"), "", now, false, None);
+        assert_eq!(tag, '\0');
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_completion_prefers_trained_paths() {
+        let dir = std::env::temp_dir().join(format!("fscomp2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::File::create(dir.join("aaa.txt")).unwrap();
+        fs::File::create(dir.join("aab.txt")).unwrap();
+        let mut m = Model::default();
+        let now = 10_000u64;
+        let d = dir.to_string_lossy().to_string();
+        m.train(&format!("vim {d}/aab.txt"), "/home/u", "/home/u", now);
+
+        let (tag, suffix) = m.predict_with(&format!("cat {d}/aa"), "", now, false, None);
+        assert_eq!(tag, 'F');
+        assert!(suffix.starts_with("b.txt"), "trained path should outrank aaa, got {suffix}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chained_trigram_decodes_multiple_words() {
+        let mut m = Model::default();
+        for _ in 0..3 {
+            m.train("deploy build release prod", "/home/u", "/home/u", 1000);
+        }
+        m.train("deploy build debug local", "/home/u", "/home/u", 1000);
+        let ids: Vec<u32> = ["deploy", "build"]
+            .iter()
+            .map(|w| m.vocab.get(w).unwrap())
+            .collect();
+        let (tag, id, _p, margin) = m.backoff_next_word(&ids, None).unwrap();
+        assert_eq!(tag, 'T');
+        assert!(margin >= CHAIN_MIN_MARGIN, "dominant continuation expected, margin {margin}");
+        let chain = m.chain_next_words(&ids, id, CHAIN_MAX_WORDS, None).unwrap();
+        let words: Vec<&str> = chain.split_whitespace().collect();
+        assert!(words.len() >= 2, "expected multi-word chain, got {chain:?}");
+        assert!(
+            words == ["release", "prod"] || words == ["debug", "local"],
+            "chain left the trained sequences: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn chain_stops_without_trigram_evidence() {
+        let mut m = Model::default();
+        for _ in 0..3 {
+            m.train("one two three four", "/home/u", "/home/u", 1000);
+        }
+        let ids: Vec<u32> = vec![m.vocab.get("two").unwrap()];
+        let (tag, id, prob, margin) = m.backoff_next_word(&ids, None).unwrap();
+        assert_eq!(tag, 'B', "bigram-only context must not start a chain");
+        assert!(prob >= B_MIN_P && margin >= B_MIN_MARGIN, "sole candidate must clear the B gate");
+        assert_eq!(m.vocab.text(id), "three");
+        let (tag, suffix) = m.predict_with("xx two ", "", 1000, true, None);
+        assert_eq!((tag, suffix.as_str()), ('B', "three"), "B answer must stay single-word");
+    }
+
+    #[test]
+    fn one_hit_bigrams_stay_silent() {
+        let mut m = Model::default();
+        m.train("aa x y", "/home/u", "/home/u", 1000);
+        m.train("bb x z", "/home/u", "/home/u", 1000);
+        let ids: Vec<u32> = vec![m.vocab.get("x").unwrap()];
+        assert!(m.backoff_next_word(&ids, None).is_none(), "1-hit bigrams must not compete");
+        let (tag, _) = m.predict_with("cc x ", "", 1000, true, None);
+        assert_eq!(tag, '\0');
+    }
+
+    #[test]
+    fn tied_bigram_stays_silent_until_dominant() {
+        let mut m = Model::default();
+        for _ in 0..2 {
+            m.train("aa p q", "/home/u", "/home/u", 1000);
+            m.train("bb p r", "/home/u", "/home/u", 1000);
+        }
+        let (tag, _) = m.predict_with("cc p ", "", 1000, true, None);
+        assert_eq!(tag, '\0', "tied bigrams must stay silent");
+        m.train("aa p q", "/home/u", "/home/u", 1000);
+        m.train("aa p q", "/home/u", "/home/u", 1000);
+        let (tag, suffix) = m.predict_with("cc p ", "", 1000, true, None);
+        assert_eq!((tag, suffix.as_str()), ('B', "q"), "dominant bigram should answer");
+    }
+
+    #[test]
+    fn seq_boost_breaks_ties_from_session_history() {
+        let mut m = Model::default();
+        for _ in 0..3 {
+            m.train("aa make build", "/home/u", "/home/u", 1000);
+            m.train("bb make clean", "/home/u", "/home/u", 1000);
+        }
+        let prev = line_shape("cd proj");
+        let after_cd = line_shape("aa make build");
+        m.record_transition(prev, after_cd, 1000);
+        let (tag, _) = m.predict_with("cc make ", "", 1000, true, None);
+        assert_eq!(tag, '\0');
+        let (tag, suffix) = m.predict_with("cc make ", "", 1000, true, Some(prev));
+        assert_eq!((tag, suffix.as_str()), ('B', "build"), "seq boost must break the tie");
+    }
+
 
     #[test]
     fn save_load_round_trip() {
@@ -675,8 +938,11 @@ mod tests {
         m.train("git status", "/home/u", "/home/u/projects/foo", 2000);
         m.train("git status", "/home/u", "/home/u/projects/foo", 3000);
         m.record_transition(line_shape("git add"), line_shape("git status"), 3000);
+        m.train("git stash", "/home/u", "/home/u", 2000);
+        m.train("git stash", "/home/u", "/home/u", 2001);
         let tmp = std::env::temp_dir().join(format!("bp-model-test-{}.bin", std::process::id()));
 
+        let stash_before = m.lines.iter().find(|e| e.text == "git stash").unwrap().weight;
         m.save(&tmp).unwrap();
         let loaded = Model::load(&tmp).unwrap();
 
@@ -689,6 +955,8 @@ mod tests {
         assert_eq!(git_status.last_used, 3000);
         assert_eq!(git_status.cwd_counts.get("/home/u/projects/foo"), Some(&2));
         assert_eq!(git_status.shape, line_shape("git status"));
+        let stash_after = loaded.lines.iter().find(|e| e.text == "git stash").unwrap().weight;
+        assert_eq!(stash_after, stash_before, "fractional weight must round-trip exactly");
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -795,7 +1063,7 @@ mod tests {
         }
         m.train("git push origin main", "/home/u", "/home/u", 1000);
         let ids: Vec<u32> = ["git"].iter().filter_map(|t| m.vocab.get(t)).collect();
-        let (_, id) = m.backoff_next_word(&ids).unwrap();
+        let (_, id, _, _) = m.backoff_next_word(&ids, None).unwrap();
         assert_eq!(m.vocab.text(id), "pull");
         let (_, word) = m.predict("git ", "", now_secs());
         assert_eq!(word, "pull");
@@ -875,6 +1143,7 @@ mod tests {
         assert!(m.lines[0].last_used > 0);
         assert!(m.path_freq.is_empty());
         assert_eq!(m.total_words, 1);
+        assert_eq!(m.lines[0].weight, m.lines[0].count as f64, "legacy bpm2 weights seed from count");
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -908,6 +1177,47 @@ mod tests {
         assert_eq!(m.lines[0].last_used, 42);
         assert_eq!(m.lines[0].shape, line_shape("git"));
         assert!(m.shape_bigram.is_empty());
+        assert_eq!(m.lines[0].weight, m.lines[0].count as f64, "legacy bpm3 weights seed from count");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn loads_legacy_bpm4() {
+        let mut body = Vec::new();
+        body.extend(1u32.to_le_bytes());
+        body.extend(3u16.to_le_bytes());
+        body.extend(b"git");
+        body.extend(5u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        body.extend(1u32.to_le_bytes());
+        body.extend(5u32.to_le_bytes());
+        body.extend(42u64.to_le_bytes());
+        body.extend(3u16.to_le_bytes());
+        body.extend(b"git");
+        body.extend(0u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        body.extend(1u32.to_le_bytes());
+        body.extend(10u64.to_le_bytes());
+        body.extend(20u64.to_le_bytes());
+        body.extend(3u32.to_le_bytes());
+        body.extend(42u64.to_le_bytes());
+
+        let tmp = std::env::temp_dir().join(format!("bp-model-bpm4-{}.bin", std::process::id()));
+        let mut file = Vec::new();
+        file.extend(b"BPM4");
+        file.extend(&body);
+        file.extend(fnv1a64(&body).to_le_bytes());
+        std::fs::write(&tmp, &file).unwrap();
+
+        let m = Model::load(&tmp).unwrap();
+        assert_eq!(m.lines.len(), 1);
+        assert_eq!(m.lines[0].text, "git");
+        assert_eq!(m.lines[0].count, 5);
+        assert_eq!(m.lines[0].last_used, 42);
+        assert_eq!(m.lines[0].shape, line_shape("git"));
+        assert_eq!(m.lines[0].weight, 5.0, "legacy bpm4 weights seed from count");
+        assert_eq!(m.shape_bigram.len(), 1);
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -947,5 +1257,59 @@ mod tests {
         for &id in &m.vocab.sorted_ids[start..end] {
             assert!(m.vocab.text(id).starts_with("cmd-"));
         }
+    }
+
+    #[test]
+    fn train_gap_decays_weight() {
+        let mut m = Model::default();
+        let t0: u64 = 1000;
+        for _ in 0..5 {
+            m.train("git pull", "/home/u", "/home/u", t0);
+        }
+        let later = t0 + 42 * 86_400;
+        m.train("git pull", "/home/u", "/home/u", later);
+        let entry = m.lines.iter().find(|e| e.text == "git pull").unwrap();
+        let expected = 5.0 * 0.5f64.powf(3.0) + 1.0;
+        assert!((entry.weight - expected).abs() < 1e-9, "weight {} vs expected {}", entry.weight, expected);
+        assert_eq!(entry.count, 6);
+    }
+
+    #[test]
+    fn decayed_weight_lets_recent_line_overtake() {
+        let mut m = Model::default();
+        let t_old: u64 = 1000;
+        for _ in 0..19 {
+            m.train("opencode", "/home/u", "/home/u", t_old);
+        }
+        let now = now_secs();
+        for _ in 0..15 {
+            m.train("opencode2", "/home/u", "/home/u", now);
+        }
+        let (tag, suffix) = m.predict("open", "", now);
+        assert_eq!(tag, 'L');
+        assert_eq!(suffix, "code2");
+    }
+
+    #[test]
+    fn accept_boost_reinforces_only_known_lines() {
+        let mut m = Model::default();
+        let t0: u64 = 1000;
+        m.train("cargo build --release", "/home/u", "/home/u", t0);
+        let entry_idx = m.lines.iter().position(|e| e.text == "cargo build --release").unwrap();
+        let before_weight = m.lines[entry_idx].weight;
+        let before_last = m.lines[entry_idx].last_used;
+        let before_count = m.lines[entry_idx].count;
+
+        let now = now_secs();
+        let hit = m.accept_boost("cargo build --release", now);
+        assert!(hit);
+        assert_eq!(m.lines[entry_idx].count, before_count, "accept_boost must not change count");
+        assert_eq!(m.lines[entry_idx].last_used, now, "accept_boost refreshes last_used");
+        let grown = m.lines[entry_idx].weight - (before_weight * recency_weight(before_last, now) + 1.0);
+        assert!(grown.abs() < 1e-9, "weight grew by ~1.0 after accept (delta={})", grown);
+
+        let miss = m.accept_boost("never-trained", now);
+        assert!(!miss);
+        assert!(!m.line_index.contains_key("never-trained"), "accept_boost must not create entries");
     }
 }
