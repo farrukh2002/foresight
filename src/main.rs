@@ -1,5 +1,6 @@
 mod config;
 mod fsindex;
+mod integrations;
 mod ngram;
 mod update;
 mod util;
@@ -27,6 +28,9 @@ use util::{data_dir, expand_home, is_path_shaped, last_shell_word, log, now_secs
 const SESSION_GAP_SECS: u64 = 1800;
 
 fn sock_path() -> PathBuf {
+    if let Ok(p) = env::var("FORESIGHT_SOCK") {
+        return PathBuf::from(p);
+    }
     data_dir().join("foresight.sock")
 }
 fn model_path() -> PathBuf {
@@ -104,9 +108,11 @@ fn main() {
             run_bench(n);
         }
         "version" => println!("foresight {}", update::CURRENT_VERSION),
+        "init" => integrations::run_init(&args[2..]),
         "update" => run_update_cmd(&args[2..]),
+        "stream" => run_stream(),
         _ => eprintln!(
-            "usage: foresight <serve|ensure-daemon|predict LINE|train LINE|accept LINE|list LINE|explain LINE|reindex|stats|version|update [--check|--pin VERSION|--channel stable|beta|dev|--enable-silent|--disable-silent]>{}",
+            "usage: foresight <serve|ensure-daemon|init|predict LINE|train LINE|accept LINE|list LINE|explain LINE|reindex|stats|version|update [--check|--pin VERSION|--channel stable|beta|dev|--enable-silent|--disable-silent]>{}",
             if cfg!(feature = "bench") { "\n       foresight bench [N]  (bench feature build only)" } else { "" }
         ),
     }
@@ -188,7 +194,7 @@ fn run_update_cmd(rest: &[String]) {
 
 fn strip_tag(reply: &str) -> &str {
     let b = reply.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'P') {
+    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'F' | b'P') {
         &reply[2..]
     } else {
         reply
@@ -436,7 +442,8 @@ fn handle_request(line: &str, mut stream: &UnixStream, state: &Arc<AppState>) ->
         "A" => {
             state.accepts.fetch_add(1, Ordering::Relaxed);
             log(&format!("ACCEPT\t{}", payload.replace('\t', " ")));
-            state.model.lock().unwrap().touch_line(payload.trim(), now_secs());
+            state.model.lock().unwrap().accept_boost(payload.trim(), now_secs());
+            *state.dirty.lock().unwrap() = true;
             "OK".to_string()
         }
         "PL" => {
@@ -596,10 +603,86 @@ fn spawn_daemon_and_wait() {
 }
 
 fn ensure_daemon() {
+    integrations::materialize_if_stale();
     if try_request("PING", "", "").as_deref() == Some("PONG") {
         return;
     }
     spawn_daemon_and_wait();
+}
+
+fn run_stream() {
+    use std::io::{BufRead, Write};
+    ensure_daemon();
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    let mut stream: Option<UnixStream> = None;
+    let mut buf_reader: Option<BufReader<UnixStream>> = None;
+
+    loop {
+        line.clear();
+        let n = match input.read_line(&mut line) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n == 0 {
+            return;
+        }
+        let line_trimmed = line.trim_end_matches(['\r', '\n']);
+        let (cwd, payload) = match line_trimmed.split_once('\t') {
+            Some((c, p)) => (c.to_string(), p),
+            None => {
+                let c = env::var("FORESIGHT_CWD")
+                    .or_else(|_| env::var("PWD"))
+                    .unwrap_or_default();
+                (c, line_trimmed)
+            }
+        };
+        let session = env::var("FORESIGHT_SESSION").unwrap_or_default();
+        let mut attempts = 0u8;
+        let reply = loop {
+            attempts += 1;
+            if stream.is_none() {
+                if let Ok(s) = UnixStream::connect(sock_path()) {
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+                    match s.try_clone() {
+                        Ok(clone) => buf_reader = Some(BufReader::new(clone)),
+                        Err(_) => { stream = None; continue; }
+                    }
+                    stream = Some(s);
+                } else {
+                    spawn_daemon_and_wait();
+                    if attempts >= 2 { break String::new(); }
+                    continue;
+                }
+            }
+            let s = stream.as_mut().unwrap();
+            let write = format!("P\t{cwd}\t{session}\t{payload}\n").into_bytes();
+            if s.write_all(&write).is_err() {
+                stream = None;
+                buf_reader = None;
+                if attempts >= 3 { break String::new(); }
+                continue;
+            }
+            let r = buf_reader.as_mut().unwrap();
+            let mut reply_line = String::new();
+            if r.read_line(&mut reply_line).is_err() {
+                stream = None;
+                buf_reader = None;
+                if attempts >= 3 { break String::new(); }
+                continue;
+            }
+            let trimmed = reply_line.trim_end_matches('\n').to_string();
+            break strip_tag(&trimmed).to_string();
+        };
+        if out.write_all(reply.as_bytes()).is_err() { return; }
+        if out.write_all(b"\n").is_err() { return; }
+        if out.flush().is_err() { return; }
+    }
 }
 
 #[cfg(feature = "bench")]
@@ -774,7 +857,7 @@ fn percentile_ns(sorted: &[u128], p: f64) -> f64 {
 #[cfg(feature = "bench")]
 fn parse_reply(reply: &str) -> (char, &str) {
     let b = reply.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'P') {
+    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'F' | b'P') {
         (b[0] as char, &reply[2..])
     } else {
         ('\0', reply)
@@ -1024,6 +1107,7 @@ fn run_bench(n: u64) {
         ('B', "bigram"),
         ('W', "word prefix"),
         ('P', "path component"),
+        ('F', "filesystem completion"),
     ] {
         if let Some(s) = by_strategy.get(&tag) {
             s.report(label);
