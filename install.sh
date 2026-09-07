@@ -58,13 +58,33 @@ tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
 mkdir -p "$BIN_DIR" "$SHARE_DIR" "$CONFIG_DIR"
 install -m 755 "$TMP_DIR/$BIN_NAME" "$BIN_DIR/$BIN_NAME"
-curl -fsSL -o "$SHARE_DIR/foresight.sh" "https://raw.githubusercontent.com/$OWNER/$REPO/main/foresight.sh"
+"$BIN_DIR/$BIN_NAME" init --quiet
 
 SOURCE_LINE="source \"$SHARE_DIR/foresight.sh\""
 BASHRC="$HOME/.bashrc"
 if ! grep -qF "$SOURCE_LINE" "$BASHRC" 2>/dev/null; then
     printf '\n%s\n' "$SOURCE_LINE" >> "$BASHRC"
     echo "Added source line to $BASHRC"
+fi
+
+BLESH_RC=""
+[ -f "$HOME/.blerc" ] && BLESH_RC="$HOME/.blerc"
+[ -z "$BLESH_RC" ] && BLESH_RC="${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh"
+if grep -q 'ble\.sh' "$HOME/.bashrc" 2>/dev/null || [ -f "$HOME/.blerc" ] || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh" ] || [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/blesh" ]; then
+    BLESH_LINE="ble-import integration/foresight"
+    if ! grep -qF "$BLESH_LINE" "$BLESH_RC" 2>/dev/null; then
+        mkdir -p "$(dirname "$BLESH_RC")"
+        printf '\n# added by foresight\n%s\n' "$BLESH_LINE" >> "$BLESH_RC"
+        echo "ble.sh: registered in $BLESH_RC"
+    fi
+fi
+
+if command -v zsh >/dev/null 2>&1 && [ -f "$HOME/.zshrc" ]; then
+    ZSH_LINE="source \"$SHARE_DIR/foresight.zsh\""
+    if ! grep -qF "$ZSH_LINE" "$HOME/.zshrc" 2>/dev/null; then
+        printf '\n# added by foresight\n%s\n' "$ZSH_LINE" >> "$HOME/.zshrc"
+        echo "zsh: registered in $HOME/.zshrc"
+    fi
 fi
 
 "$BIN_DIR/$BIN_NAME" ensure-daemon >/dev/null 2>&1 || true
