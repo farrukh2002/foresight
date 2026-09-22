@@ -32,12 +32,28 @@ fn blesh_layer_dir() -> PathBuf {
 pub fn materialize() -> std::io::Result<()> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("foresight.sh"), FORESIGHT_SH)?;
-    std::fs::write(dir.join("foresight.zsh"), FORESIGHT_ZSH)?;
+    crate::util::atomic_write(&dir.join("foresight.sh"), |w| {
+        use std::io::Write;
+        w.write_all(FORESIGHT_SH.as_bytes())?;
+        w.flush()
+    })?;
+    crate::util::atomic_write(&dir.join("foresight.zsh"), |w| {
+        use std::io::Write;
+        w.write_all(FORESIGHT_ZSH.as_bytes())?;
+        w.flush()
+    })?;
     let layer_dir = blesh_layer_dir();
     std::fs::create_dir_all(&layer_dir)?;
-    std::fs::write(layer_dir.join("foresight.bash"), BLESH_LAYER)?;
-    std::fs::write(stamp_path(), content_stamp())?;
+    crate::util::atomic_write(&layer_dir.join("foresight.bash"), |w| {
+        use std::io::Write;
+        w.write_all(BLESH_LAYER.as_bytes())?;
+        w.flush()
+    })?;
+    crate::util::atomic_write(&stamp_path(), |w| {
+        use std::io::Write;
+        w.write_all(content_stamp().as_bytes())?;
+        w.flush()
+    })?;
     Ok(())
 }
 
@@ -52,25 +68,18 @@ pub fn materialize_if_stale() {
         }
     }
 }
-
-pub fn run_init(rest: &[String]) {
+pub fn run_init(rest: &[String]) -> Result<(), String> {
     let quiet = rest.iter().any(|a| a == "--quiet" || a == "-q");
-    match materialize() {
-        Ok(()) => {
-            if !quiet {
-                println!("foresight: integration files written:");
-                println!("  bash:  {}", data_dir().join("foresight.sh").display());
-                println!("  zsh:   {}", data_dir().join("foresight.zsh").display());
-                println!("  blesh: {}", blesh_layer_dir().join("foresight.bash").display());
-                println!("setup:");
-                println!("  bash: source \"{}\" in ~/.bashrc", data_dir().join("foresight.sh").display());
-                println!("  zsh:  source \"{}\" in ~/.zshrc", data_dir().join("foresight.zsh").display());
-                println!("  ble.sh: `ble-import integration/foresight` in ~/.blerc");
-            }
-        }
-        Err(e) => {
-            eprintln!("foresight init: {e}");
-            std::process::exit(1);
-        }
+    materialize().map_err(|e| format!("foresight init: {e}"))?;
+    if !quiet {
+        println!("foresight: integration files written:");
+        println!("  bash:  {}", data_dir().join("foresight.sh").display());
+        println!("  zsh:   {}", data_dir().join("foresight.zsh").display());
+        println!("  blesh: {}", blesh_layer_dir().join("foresight.bash").display());
+        println!("setup:");
+        println!("  bash: source \"{}\" in ~/.bashrc", data_dir().join("foresight.sh").display());
+        println!("  zsh:  source \"{}\" in ~/.zshrc", data_dir().join("foresight.zsh").display());
+        println!("  ble.sh: `ble-import integration/foresight` in ~/.blerc");
     }
+    Ok(())
 }

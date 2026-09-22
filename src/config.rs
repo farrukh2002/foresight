@@ -14,13 +14,19 @@ pub struct Config {
 #[serde(default)]
 pub struct UpdateConfig {
     pub mode: String,
+    pub channel: String,
     pub pinned_version: String,
     pub check_interval_hours: u64,
 }
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        UpdateConfig { mode: "manual".into(), pinned_version: String::new(), check_interval_hours: 24 }
+        UpdateConfig {
+            mode: "manual".into(),
+            channel: String::new(),
+            pinned_version: String::new(),
+            check_interval_hours: 24,
+        }
     }
 }
 
@@ -63,7 +69,7 @@ fn strs(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-const TEMPLATE: &str = r#"# foresight filesystem index config.
+pub const TEMPLATE: &str = r#"# foresight filesystem index config.
 
 [scan]
 # scan mode: "normal" or "deep"
@@ -101,6 +107,9 @@ normal_mode_exclude_paths = ["Android", "go", "flutter"]
 # update mode: "manual" or "silent"
 mode = "manual"
 
+# release channel to track: "stable", "beta", "dev", or "" (blank = track current binary channel)
+channel = ""
+
 # exact release tag to stay on, e.g. "v0.2.0" (blank = always latest)
 pinned_version = ""
 
@@ -118,9 +127,25 @@ impl Config {
             }
         } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
-            std::fs::write(&path, TEMPLATE).ok();
+            let _ = crate::util::atomic_write(&path, |writer| {
+                use std::io::Write;
+                writer.write_all(TEMPLATE.as_bytes())?;
+                writer.flush()
+            });
         }
         Config::default()
+    }
+
+    /// Read-only loader for update operations: never creates the config file.
+    /// Missing file => defaults; malformed/unreadable existing file => error.
+    pub fn load_readonly(home: &str) -> Result<Config, String> {
+        let path = PathBuf::from(home).join(".config/foresight/config.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text)
+                .map_err(|e| format!("config.toml parse error: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(format!("could not read {}: {e}", path.display())),
+        }
     }
 
     pub fn resolved_roots(&self, home: &str) -> Vec<PathBuf> {

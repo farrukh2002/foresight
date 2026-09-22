@@ -2,13 +2,12 @@
 (and the real `foresight` CLI, unmodified) can be tested without the
 actual Rust daemon or model. Canned predict replies only.
 
-Wire protocol (matches src/main.rs handle_request): one line per
-request, `kind\\tcwd\\tsession\\tpayload\\n`; one line per reply.
-predict/list replies are tag-prefixed (`P:suffix`); train/accept reply
-`OK`; PING replies `PONG`.
+Wire protocol: one JSON object per line with kind/cwd/session/payload fields.
+Replies are Result objects: {"Ok": string} or {"Ok": [tagged suggestions]}.
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -18,7 +17,7 @@ class MockDaemon:
     def __init__(self, sock_path: str, predict: dict[str, str] | None = None):
         self.sock_path = sock_path
         self.predict = predict or {}
-        self.requests: list[str] = []
+        self.requests: list[dict[str, str]] = []
         self._srv: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -72,18 +71,17 @@ class MockDaemon:
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    reply = self._reply(line.decode("utf-8", "replace"))
-                    conn.sendall((reply + "\n").encode("utf-8"))
+                    reply = self._reply(json.loads(line))
+                    conn.sendall((json.dumps({"Ok": reply}) + "\n").encode("utf-8"))
         except OSError:
             pass
         finally:
             conn.close()
 
-    def _reply(self, line: str) -> str:
-        self.requests.append(line)
-        parts = line.split("\t")
-        kind = parts[0] if parts else ""
-        payload = parts[3] if len(parts) > 3 else ""
+    def _reply(self, request: dict[str, str]) -> str | list[str]:
+        self.requests.append(request)
+        kind = request["kind"]
+        payload = request["payload"]
         if kind == "PING":
             return "PONG"
         if kind in ("T", "A"):
@@ -93,5 +91,5 @@ class MockDaemon:
             return f"P:{suggestion}" if suggestion else ""
         if kind == "PL":
             suggestion = self.predict.get(payload, "")
-            return f"P:{suggestion}" if suggestion else ""
+            return [f"P:{suggestion}"] if suggestion else []
         return ""

@@ -2,1143 +2,600 @@ mod config;
 mod fsindex;
 mod integrations;
 mod ngram;
+mod protocol;
 mod update;
 mod util;
 mod vocab;
 
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-#[cfg(feature = "bench")]
-use std::time::Instant;
+use parking_lot::{Condvar, Mutex};
 
 use config::Config;
-use fsindex::FsIndex;
+use fsindex::{FsIndex, Watcher};
 use ngram::{line_shape, Model};
-use util::{data_dir, expand_home, is_path_shaped, last_shell_word, log, now_secs, wants_dirs};
+use protocol::{Reply, Request, Response};
+use util::{data_dir, escape_path_suffix, expand_home, is_path_shaped, last_shell_word, log, now_secs, wants_dirs};
 
 const SESSION_GAP_SECS: u64 = 1800;
 
 fn sock_path() -> PathBuf {
-    if let Ok(p) = env::var("FORESIGHT_SOCK") {
-        return PathBuf::from(p);
-    }
-    data_dir().join("foresight.sock")
+    env::var_os("FORESIGHT_SOCK").map(PathBuf::from).unwrap_or_else(|| data_dir().join("foresight.sock"))
 }
-fn model_path() -> PathBuf {
-    data_dir().join("model.bin")
-}
-fn fsindex_path() -> PathBuf {
-    data_dir().join("fsindex.bin")
-}
-fn lock_path() -> PathBuf {
-    data_dir().join("daemon.pid")
-}
-fn history_path() -> PathBuf {
-    PathBuf::from(env::var("HOME").expect("HOME not set")).join(".bash_history")
-}
-
-fn current_dir_string() -> String {
-    env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+fn model_path() -> PathBuf { data_dir().join("model.bin") }
+fn fsindex_path() -> PathBuf { data_dir().join("fsindex.bin") }
+fn lock_path() -> PathBuf { data_dir().join("daemon.pid") }
+fn history_path() -> PathBuf { PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".bash_history") }
+fn current_dir_string() -> Result<String, String> {
+    env::current_dir().map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string())
 }
 
 struct AppState {
     model: Mutex<Model>,
     fsindex: Arc<Mutex<FsIndex>>,
+    watcher: Mutex<Option<Watcher>>,
     home: String,
-    dirty: Mutex<bool>,
+    dirty: AtomicBool,
+    // Admission and persistence share one lock: no training can be acknowledged
+    // between the shutdown flush and closing admission.
+    mutations: Mutex<()>,
+    stopping: AtomicBool,
+    exit_ready: AtomicBool,
+    reload: Mutex<u64>,
+    wake: Condvar,
     sessions: Mutex<HashMap<String, SessionTail>>,
     predicts: AtomicU64,
     accepts: AtomicU64,
 }
 
 #[derive(Default, Clone, Copy)]
-struct SessionTail {
-    last_shape: u64,
-    last_time: u64,
+struct SessionTail { last_shape: u64, last_time: u64 }
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1).collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("foresight: {e}"); ExitCode::FAILURE }
+    }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
-    let arg = args.get(2).map(|s| s.as_str()).unwrap_or("");
-    match cmd {
-        "serve" => serve(),
-        "ensure-daemon" => ensure_daemon(),
-        "predict" => print!("{}", strip_tag(&client_request("P", &current_dir_string(), arg).unwrap_or_default())),
-        "train" => {
-            client_request("T", &current_dir_string(), arg);
-        }
-        "accept" => {
-            client_request("A", &current_dir_string(), arg);
+fn one_arg<'a>(args: &'a [String], usage: &str) -> Result<&'a str, String> {
+    if args.len() != 1 { return Err(format!("usage: foresight {usage}")); }
+    Ok(&args[0])
+}
+fn no_args(args: &[String]) -> Result<(), String> {
+    if args.is_empty() { Ok(()) } else { Err("unexpected arguments".into()) }
+}
+fn text_reply(reply: Reply) -> Result<String, String> {
+    match reply { Reply::Text(text) => Ok(text), Reply::List(_) => Err("unexpected list reply".into()) }
+}
+
+fn run(args: Vec<String>) -> Result<(), String> {
+    let Some((cmd, rest)) = args.split_first() else {
+        return Err("usage: foresight <serve|ensure-daemon|init|predict|train|accept|list|explain|reindex|stats|version|update|stream>".into());
+    };
+    match cmd.as_str() {
+        "serve" => { no_args(rest)?; serve() }
+        "ensure-daemon" => { no_args(rest)?; ensure_daemon() }
+        "predict" | "train" | "accept" | "explain" => {
+            let payload = one_arg(rest, &format!("{cmd} LINE"))?;
+            let kind = match cmd.as_str() { "predict" => "P", "train" => "T", "accept" => "A", _ => "E" };
+            let reply = text_reply(client_request(kind, &current_dir_string()?, payload)?)?;
+            if cmd == "predict" { print!("{}", strip_tag(&reply)); }
+            if cmd == "explain" { println!("{reply}"); }
+            Ok(())
         }
         "list" => {
-            if let Some(r) = client_request("PL", &current_dir_string(), arg) {
-                for item in r.split('\t') {
-                    println!("{}", strip_tag(item));
-                }
+            let null = rest.first().is_some_and(|s| s == "--null");
+            let payload = one_arg(if null { &rest[1..] } else { rest }, "list [--null] LINE")?;
+            let Reply::List(items) = client_request("PL", &current_dir_string()?, payload)? else {
+                return Err("unexpected non-list reply".into());
+            };
+            let mut out = io::stdout().lock();
+            for item in items {
+                out.write_all(strip_tag(&item).as_bytes()).map_err(|e| e.to_string())?;
+                out.write_all(if null { b"\0" } else { b"\n" }).map_err(|e| e.to_string())?;
             }
+            out.flush().map_err(|e| e.to_string())
         }
-        "explain" => {
-            if let Some(r) = client_request("E", &current_dir_string(), arg) {
-                println!("{r}");
-            }
+        "reindex" | "stats" => {
+            no_args(rest)?;
+            println!("{}", text_reply(client_request(if cmd == "reindex" { "REINDEX" } else { "STATS" }, "", "")?)?);
+            Ok(())
         }
-        "reindex" => {
-            if let Some(r) = client_request("REINDEX", "", "") {
-                println!("{r}");
-            }
-        }
-        "stats" => {
-            if let Some(r) = client_request("STATS", "", "") {
-                println!("{r}");
-            }
-        }
+        "version" => { no_args(rest)?; println!("foresight {}", update::CURRENT_VERSION); Ok(()) }
+        "init" => integrations::run_init(rest),
+        "update" => run_update_cmd(rest),
+        "stream" => { no_args(rest)?; run_stream() }
         #[cfg(feature = "bench")]
         "bench" => {
-            let n: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-            run_bench(n);
+            let n = if rest.is_empty() { 1_000_000 } else {
+                one_arg(rest, "bench [N]")?.parse::<u64>().map_err(|_| "N must be a positive integer")?
+            };
+            if n == 0 { return Err("N must be a positive integer".into()); }
+            run_bench(n)
         }
-        "version" => println!("foresight {}", update::CURRENT_VERSION),
-        "init" => integrations::run_init(&args[2..]),
-        "update" => run_update_cmd(&args[2..]),
-        "stream" => run_stream(),
-        _ => eprintln!(
-            "usage: foresight <serve|ensure-daemon|init|predict LINE|train LINE|accept LINE|list LINE|explain LINE|reindex|stats|version|update [--check|--pin VERSION|--channel stable|beta|dev|--enable-silent|--disable-silent]>{}",
-            if cfg!(feature = "bench") { "\n       foresight bench [N]  (bench feature build only)" } else { "" }
-        ),
+        _ => Err(format!("unknown command: {cmd}")),
     }
 }
 
-fn run_update_cmd(rest: &[String]) {
-    let home = env::var("HOME").expect("HOME not set");
-    let mut check_only = false;
-    let mut pin: Option<String> = None;
-    let mut channel: Option<String> = None;
-    let mut enable_silent = false;
-    let mut disable_silent = false;
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--check" => check_only = true,
-            "--pin" => {
-                i += 1;
-                pin = rest.get(i).cloned();
-            }
-            "--channel" => {
-                i += 1;
-                channel = rest.get(i).cloned();
-            }
-            "--enable-silent" => enable_silent = true,
-            "--disable-silent" => disable_silent = true,
-            _ => {}
+fn run_update_cmd(rest: &[String]) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|e| e.to_string())?;
+    let mut check = false;
+    let mut pin = None;
+    let mut channel = None;
+    let mut mode = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--check" if !check => check = true,
+            "--pin" if pin.is_none() => pin = Some(args.next().filter(|v| !v.starts_with('-')).ok_or("--pin requires VERSION")?.as_str()),
+            "--channel" if channel.is_none() => channel = Some(args.next().filter(|v| !v.starts_with('-')).ok_or("--channel requires a channel")?.as_str()),
+            "--enable-silent" if mode.is_none() => mode = Some("silent"),
+            "--disable-silent" if mode.is_none() => mode = Some("manual"),
+            _ => return Err(format!("unknown, duplicate, or conflicting option: {arg}")),
         }
-        i += 1;
     }
-
-    if let Some(c) = &channel
-        && !update::valid_channel(c)
-    {
-        eprintln!("invalid channel '{c}', expected one of: {}", update::CHANNELS.join(", "));
-        return;
+    if pin.is_some() && (channel.is_some() || check) || mode.is_some() && (pin.is_some() || channel.is_some() || check) {
+        return Err("conflicting update options".into());
     }
-
-    if enable_silent {
-        match update::set_update_mode(&home, "silent") {
-            Ok(()) => println!("silent auto-update enabled"),
-            Err(e) => eprintln!("failed to update config: {e}"),
-        }
-        return;
+    if let Some(channel) = channel {
+        if !update::valid_channel(channel) { return Err(format!("invalid channel: {channel}")); }
     }
-    if disable_silent {
-        match update::set_update_mode(&home, "manual") {
-            Ok(()) => println!("silent auto-update disabled"),
-            Err(e) => eprintln!("failed to update config: {e}"),
-        }
-        return;
-    }
-    if check_only {
-        match update::check_only(channel.as_deref()) {
+    if let Some(mode) = mode {
+        update::set_update_mode(&home, mode).map_err(|e| e.to_string())?;
+        notify_running("RELOAD")?;
+        println!("silent auto-update {}", if mode == "silent" { "enabled" } else { "disabled" });
+    } else if check {
+        match update::check_only(channel)? {
             Some(tag) => println!("update available: {} -> {tag}", update::CURRENT_VERSION),
-            None => println!(
-                "up to date ({}, channel: {})",
-                update::CURRENT_VERSION,
-                channel.as_deref().unwrap_or_else(|| update::current_channel())
-            ),
+            None => println!("up to date ({})", update::CURRENT_VERSION),
         }
-        return;
-    }
-
-    match update::apply_update(pin.as_deref(), channel.as_deref()) {
-        Ok(Some(o)) => {
-            println!("updated {} -> {}", o.from, o.to);
-            if let Some(p) = &pin
-                && let Err(e) = update::set_pinned_version(&home, p)
-            {
-                eprintln!("update installed but failed to persist pin: {e}");
+    } else {
+        match update::apply_update(pin, channel)? {
+            Some(outcome) => {
+                println!("updated {} -> {}", outcome.from, outcome.to);
+                notify_running("SHUTDOWN")?;
             }
-            client_request("SHUTDOWN", "", "");
+            None => println!("already up to date ({})", update::CURRENT_VERSION),
         }
-        Ok(None) => println!("already up to date ({})", update::CURRENT_VERSION),
-        Err(e) => eprintln!("update failed: {e}"),
     }
+    Ok(())
 }
 
 fn strip_tag(reply: &str) -> &str {
     let b = reply.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'F' | b'P') {
-        &reply[2..]
-    } else {
-        reply
-    }
+    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'F' | b'P') { &reply[2..] } else { reply }
 }
 
-#[cfg(unix)]
-fn tighten_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(data_dir(), std::fs::Permissions::from_mode(0o700));
-}
-
-fn acquire_singleton_lock() -> bool {
-    let path = lock_path();
-    loop {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                let _ = f.write_all(std::process::id().to_string().as_bytes());
-                return true;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let alive = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
-                    .unwrap_or(false);
-                if alive {
-                    return false;
-                }
-                let _ = std::fs::remove_file(&path);
-            }
-            Err(_) => return false,
+fn acquire_singleton_lock() -> io::Result<Option<std::fs::File>> {
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path())?;
+    match file.try_lock() {
+        Ok(()) => {
+            file.set_len(0)?;
+            write!(file, "{}", std::process::id())?;
+            Ok(Some(file))
         }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
-fn serve() {
-    std::fs::create_dir_all(data_dir()).ok();
-    tighten_permissions();
-    if !acquire_singleton_lock() {
-        log("another daemon instance already holds the lock - exiting");
-        return;
+fn flush_model(state: &AppState) -> Result<(), String> {
+    if state.dirty.load(Ordering::Acquire) {
+        state.model.lock().save(&model_path()).map_err(|e| {
+            let message = format!("model persistence failed: {e}");
+            log(&message);
+            message
+        })?;
+        state.dirty.store(false, Ordering::Release);
     }
+    Ok(())
+}
+fn flush_index(state: &AppState) -> Result<(), String> {
+    state.fsindex.lock().save(&fsindex_path()).map_err(|e| {
+        let message = format!("filesystem index persistence failed: {e}");
+        log(&message);
+        message
+    })
+}
+fn shutdown(state: &AppState) -> Result<(), String> {
+    let _guard = state.mutations.lock();
+    flush_model(state)?;
+    flush_index(state)?;
+    state.stopping.store(true, Ordering::Release);
+    state.wake.notify_all();
+    Ok(())
+}
+fn reindex(state: &AppState) -> Result<usize, String> {
+    let mut owner = state.watcher.lock();
+    drop(owner.take());
+    let config = Config::load_or_create(&state.home);
+    *owner = Some(Watcher::start(state.fsindex.clone(), config, &state.home).map_err(|e| e.to_string())?);
+    flush_index(state)?;
+    Ok(state.fsindex.lock().paths.len())
+}
 
-    let home = env::var("HOME").expect("HOME not set");
-    let config = Config::load_or_create(&home);
-    log(&format!("daemon starting, scan mode = {}", config.scan.mode));
-
+fn serve() -> Result<(), String> {
+    std::fs::create_dir_all(data_dir()).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(data_dir(), std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    let Some(_singleton) = acquire_singleton_lock().map_err(|e| e.to_string())? else { return Ok(()); };
+    let home = env::var("HOME").map_err(|e| e.to_string())?;
     let mut model = Model::load(&model_path()).unwrap_or_else(|e| {
         log(&format!("model.bin unreadable ({e}), starting fresh"));
         Model::default()
     });
     if model.lines.is_empty() {
-        let now = now_secs();
-        model.bootstrap_from_history(&history_path(), &home, now);
-        model.import_zsh_history(&home, now);
+        model.bootstrap_from_history(&history_path(), &home, now_secs());
+        model.import_zsh_history(&home, now_secs());
     } else {
         model.seed_transitions_from_history(&history_path(), now_secs());
     }
-    let _ = model.save(&model_path());
-
-    let fsindex = Arc::new(Mutex::new(FsIndex::load(&fsindex_path()).unwrap_or_else(|_| FsIndex::empty())));
-
     let state = Arc::new(AppState {
         model: Mutex::new(model),
-        fsindex: fsindex.clone(),
-        home: home.clone(),
-        dirty: Mutex::new(false),
-        sessions: Mutex::new(HashMap::new()),
-        predicts: AtomicU64::new(0),
-        accepts: AtomicU64::new(0),
+        fsindex: Arc::new(Mutex::new(FsIndex::load(&fsindex_path()).unwrap_or_else(|_| FsIndex::empty()))),
+        watcher: Mutex::new(None), home, dirty: AtomicBool::new(true), mutations: Mutex::new(()),
+        stopping: AtomicBool::new(false), exit_ready: AtomicBool::new(false),
+        reload: Mutex::new(0), wake: Condvar::new(), sessions: Mutex::new(HashMap::new()),
+        predicts: AtomicU64::new(0), accepts: AtomicU64::new(0),
     });
-
-    {
-        let fsindex = fsindex.clone();
-        let config = config.clone();
-        let home = home.clone();
-        thread::spawn(move || {
-            let fresh = FsIndex::build(&config, &home);
-            log(&format!("fs index built: {} paths", fresh.paths.len()));
-            let _ = fresh.save(&fsindex_path());
-            *fsindex.lock().unwrap() = fresh;
-
-            let (names, paths) = config.effective_excludes();
-            for root in config.resolved_roots(&home) {
-                let fsindex = fsindex.clone();
-                let names = names.clone();
-                let paths = paths.clone();
-                thread::spawn(move || fsindex::watch(fsindex, root, names, paths));
-            }
-        });
+    { let _guard = state.mutations.lock(); let _ = flush_model(&state); }
+    // Bind before the potentially long initial scan. The singleton lock is held
+    // for the entire lifetime; the lock file is never unlinked.
+    match std::fs::remove_file(sock_path()) {
+        Ok(()) => {}, Err(e) if e.kind() == io::ErrorKind::NotFound => {}, Err(e) => return Err(e.to_string()),
     }
-
-    {
-        let fsindex = fsindex.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(300));
-            let snapshot = {
-                let idx = fsindex.lock().unwrap();
-                idx.paths.clone()
-            };
-            let _ = FsIndex { paths: snapshot, usage: Vec::new(), usage_version: 0 }.save(&fsindex_path());
-        });
-    }
-
-    {
-        let state = state.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(2));
-            let mut dirty = state.dirty.lock().unwrap();
-            if *dirty {
-                *dirty = false;
-                drop(dirty);
-                let _ = state.model.lock().unwrap().save(&model_path());
-            }
-        });
-    }
-
-    if config.update.mode == "silent" {
-        let home = home.clone();
-        thread::spawn(move || loop {
-            let cfg = Config::load_or_create(&home);
-            let pin = if cfg.update.pinned_version.is_empty() { None } else { Some(cfg.update.pinned_version) };
-            match update::apply_update(pin.as_deref(), None) {
-                Ok(Some(o)) => {
-                    log(&format!("silent update applied: {} -> {}, restarting", o.from, o.to));
-                    std::process::exit(0);
-                }
-                Ok(None) => {}
-                Err(e) => log(&format!("silent update check failed: {e}")),
-            }
-            thread::sleep(Duration::from_secs(cfg.update.check_interval_hours.max(1) * 3600));
-        });
-    }
-
-    if sock_path().exists() {
-        std::fs::remove_file(sock_path()).ok();
-    }
-    let listener = UnixListener::bind(sock_path()).expect("failed to bind socket");
+    let listener = UnixListener::bind(sock_path()).map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let scan_state = state.clone();
+    let initial_scan = thread::spawn(move || {
+        if let Err(e) = reindex(&scan_state) { log(&format!("initial reindex failed: {e}")); }
+    });
+    let scheduler_state = state.clone();
+    let scheduler = thread::spawn(move || update_scheduler(scheduler_state));
     log("daemon ready, socket bound");
+    let mut last_flush = std::time::Instant::now();
+    let mut last_index_flush = std::time::Instant::now();
+    while !state.exit_ready.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let state = state.clone();
+                thread::spawn(move || handle_conn(stream, state));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(10)),
+            Err(e) => { log(&format!("socket accept failed: {e}")); thread::sleep(Duration::from_millis(100)); }
+        }
+        if last_flush.elapsed() >= Duration::from_secs(2) {
+            let _guard = state.mutations.lock();
+            let _ = flush_model(&state);
+            last_flush = std::time::Instant::now();
+        }
+        if last_index_flush.elapsed() >= Duration::from_secs(300) {
+            let _ = flush_index(&state);
+            last_index_flush = std::time::Instant::now();
+        }
+    }
+    state.wake.notify_all();
+    let _ = initial_scan.join();
+    drop(state.watcher.lock().take());
+    let _ = scheduler.join();
+    { let _guard = state.mutations.lock(); flush_model(&state)?; flush_index(&state)?; }
+    std::fs::remove_file(sock_path()).map_err(|e| e.to_string())?;
+    Ok(())
+}
 
-    for conn in listener.incoming().flatten() {
-        let state = state.clone();
-        thread::spawn(move || handle_conn(conn, state));
+fn update_scheduler(state: Arc<AppState>) {
+    let mut restart_pending = false;
+    loop {
+        let generation = *state.reload.lock();
+        if state.stopping.load(Ordering::Acquire) { return; }
+        let config = Config::load_or_create(&state.home);
+        if config.update.mode == "silent" && !restart_pending {
+            // apply_update resolves policy afresh, including stored channel/pin.
+            match update::apply_update(None, None) {
+                Ok(Some(outcome)) => {
+                    log(&format!("silent update applied: {} -> {}", outcome.from, outcome.to));
+                    restart_pending = true;
+                }
+                Ok(None) => {},
+                Err(e) => log(&format!("silent update failed: {e}")),
+            }
+        }
+        if restart_pending {
+            match shutdown(&state) {
+                Ok(()) => { state.exit_ready.store(true, Ordering::Release); return; }
+                Err(e) => log(&format!("update restart postponed: {e}")),
+            }
+        }
+        let mut current = state.reload.lock();
+        if state.stopping.load(Ordering::Acquire) { return; }
+        if *current != generation { continue; }
+        let interval = Duration::from_secs(if restart_pending { 2 } else { config.update.check_interval_hours.max(1).saturating_mul(3600) });
+        state.wake.wait_for(&mut current, interval);
+        // A timeout or RELOAD always re-reads settings before the next check.
     }
 }
 
 fn handle_conn(stream: UnixStream, state: Arc<AppState>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-        if !handle_request(&line, &stream, &state) {
+        let request: Request = match protocol::read_json(&mut reader) {
+            Ok(request) => request,
+            Err(e) => {
+                if e.kind() != io::ErrorKind::UnexpectedEof {
+                    let response: Response = Err(format!("invalid request: {e}"));
+                    let _ = protocol::write_json(&stream, &response);
+                }
+                return;
+            }
+        };
+        let response = handle_request(&request, &state);
+        let shutdown = request.kind == "SHUTDOWN" && response.is_ok();
+        let written = protocol::write_json(&stream, &response);
+        if shutdown {
+            state.exit_ready.store(true, Ordering::Release);
             return;
         }
+        if written.is_err() || state.stopping.load(Ordering::Acquire) { return; }
     }
 }
 
-fn resolve_prev_shape(state: &AppState, field: &str, now: u64) -> Option<u64> {
-    if let Some(hex) = field.strip_prefix('#') {
-        return u64::from_str_radix(hex, 16).ok().filter(|&s| s != 0);
-    }
-    if field.is_empty() {
-        return None;
-    }
-    let sessions = state.sessions.lock().unwrap();
-    let tail = sessions.get(field)?;
-    if now.saturating_sub(tail.last_time) > SESSION_GAP_SECS || tail.last_shape == 0 {
-        None
-    } else {
-        Some(tail.last_shape)
-    }
+fn resolve_prev_shape(state: &AppState, session: &str, now: u64) -> Option<u64> {
+    let sessions = state.sessions.lock();
+    let tail = sessions.get(session)?;
+    if now.saturating_sub(tail.last_time) > SESSION_GAP_SECS || tail.last_shape == 0 { None } else { Some(tail.last_shape) }
 }
-
 fn session_advance(state: &AppState, session: &str, shape: u64, now: u64) -> Option<u64> {
-    if session.is_empty() || shape == 0 {
-        return None;
-    }
-    let mut sessions = state.sessions.lock().unwrap();
-    if sessions.len() > 64 {
-        sessions.retain(|_, t| now.saturating_sub(t.last_time) < SESSION_GAP_SECS * 2);
-    }
-    let tail = sessions.entry(session.to_string()).or_default();
-    let prev = if now.saturating_sub(tail.last_time) <= SESSION_GAP_SECS && tail.last_shape != 0 {
-        Some(tail.last_shape)
-    } else {
-        None
-    };
-    tail.last_shape = shape;
-    tail.last_time = now;
+    if session.is_empty() || shape == 0 { return None; }
+    let mut sessions = state.sessions.lock();
+    if sessions.len() > 64 { sessions.retain(|_, t| now.saturating_sub(t.last_time) < SESSION_GAP_SECS * 2); }
+    let tail = sessions.entry(session.to_owned()).or_default();
+    let prev = if now.saturating_sub(tail.last_time) <= SESSION_GAP_SECS && tail.last_shape != 0 { Some(tail.last_shape) } else { None };
+    *tail = SessionTail { last_shape: shape, last_time: now };
     prev
 }
 
-fn handle_request(line: &str, mut stream: &UnixStream, state: &Arc<AppState>) -> bool {
-    let line = line.trim_end_matches('\n');
-    let mut parts = line.splitn(4, '\t');
-    let kind = parts.next().unwrap_or("");
-    let cwd = parts.next().unwrap_or("");
-    let session = parts.next().unwrap_or("");
-    let payload = parts.next().unwrap_or("");
-
-    let reply = match kind {
-        "PING" => "PONG".to_string(),
-        "SHUTDOWN" => {
-            stream.write_all(b"OK\n").ok();
-            log("daemon shutting down for update");
-            std::process::exit(0);
+fn handle_request(request: &Request, state: &AppState) -> Response {
+    let Request { kind, cwd, session, payload } = request;
+    if state.stopping.load(Ordering::Acquire) { return Err("daemon is shutting down".into()); }
+    let reply = match kind.as_str() {
+        "PING" => "PONG".into(),
+        "SHUTDOWN" => { shutdown(state)?; "OK".into() }
+        "RELOAD" => {
+            *state.reload.lock() += 1;
+            state.wake.notify_all();
+            "OK".into()
         }
         "P" => {
             state.predicts.fetch_add(1, Ordering::Relaxed);
-            let prev = resolve_prev_shape(state, session, now_secs());
-            combined_predict(state, cwd, payload, prev)
+            combined_predict(state, cwd, payload, resolve_prev_shape(state, session, now_secs()))
         }
-        "PH" => {
-            state.predicts.fetch_add(1, Ordering::Relaxed);
-            let mut f = payload.splitn(2, '\t');
-            let idx: usize = f.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
-            let partial = f.next().unwrap_or("");
-            let prev = resolve_prev_shape(state, session, now_secs());
-            let (tag, suffix) = state.model.lock().unwrap().holdout_predict(idx, partial, cwd, now_secs(), prev);
-            if tag == '\0' {
-                String::new()
-            } else {
-                format!("{tag}:{suffix}")
-            }
-        }
-        "T" => {
+        "T" | "A" => {
+            let _guard = state.mutations.lock();
+            if state.stopping.load(Ordering::Acquire) { return Err("daemon is shutting down".into()); }
             let now = now_secs();
-            let shape = line_shape(payload.trim());
-            let prev = session_advance(state, session, shape, now);
-            {
-                let mut model = state.model.lock().unwrap();
+            if kind == "T" {
+                let shape = line_shape(payload.trim());
+                let prev = session_advance(state, session, shape, now);
+                let mut model = state.model.lock();
                 model.train(payload, &state.home, cwd, now);
-                if let Some(prev) = prev {
-                    model.record_transition(prev, shape, now);
-                }
+                if let Some(prev) = prev { model.record_transition(prev, shape, now); }
+            } else {
+                state.accepts.fetch_add(1, Ordering::Relaxed);
+                state.model.lock().accept_boost(payload.trim(), now);
             }
-            *state.dirty.lock().unwrap() = true;
-            "OK".to_string()
-        }
-        "A" => {
-            state.accepts.fetch_add(1, Ordering::Relaxed);
-            log(&format!("ACCEPT\t{}", payload.replace('\t', " ")));
-            state.model.lock().unwrap().accept_boost(payload.trim(), now_secs());
-            *state.dirty.lock().unwrap() = true;
-            "OK".to_string()
+            state.dirty.store(true, Ordering::Release);
+            "OK".into()
         }
         "PL" => {
             let now = now_secs();
             let prev = resolve_prev_shape(state, session, now);
-            let model = state.model.lock().unwrap();
-            let mut items: Vec<String> = model
-                .topk(payload, cwd, now, 5, prev)
-                .into_iter()
-                .map(|(tag, suffix)| format!("{tag}:{suffix}"))
-                .collect();
-            if !payload.is_empty() && !payload.ends_with(' ') {
-                let last = last_shell_word(payload);
-                if let Some(abs) = expand_home(&last, &state.home, Some(cwd)) {
-                    let cmd = payload.split_whitespace().next().unwrap_or("");
-                    let mut idx = state.fsindex.lock().unwrap();
-                    if idx.usage_version != model.version {
-                        idx.refresh_usage(&model, now, model.version);
-                    }
-                    for comp in idx.best_components(&abs, wants_dirs(cmd), 3) {
-                        items.push(format!("P:{comp}"));
-                    }
-                }
-            }
-            items.join("\t")
+            let model = state.model.lock();
+            let mut items: Vec<String> = model.topk(payload, cwd, now, 5, prev).into_iter()
+                .map(|(tag, suffix)| format!("{tag}:{suffix}")).collect();
+            let paths = index_predictions(state, &model, cwd, payload, now, 3);
+            if is_path_shaped(&last_shell_word(payload)) {
+                items.splice(0..0, paths);
+            } else { items.extend(paths); }
+            let mut seen = std::collections::HashSet::new();
+            items.retain(|item| seen.insert(strip_tag(item).to_owned()));
+            return Ok(Reply::List(items));
         }
         "E" => {
             let now = now_secs();
             let prev = resolve_prev_shape(state, session, now);
-            let model = state.model.lock().unwrap();
-            let mut out = model.explain(payload, cwd, now, prev);
-            if !payload.is_empty() && !payload.ends_with(' ') {
-                let last = last_shell_word(payload);
-                if let Some(abs) = expand_home(&last, &state.home, Some(cwd)) {
-                    let cmd = payload.split_whitespace().next().unwrap_or("");
-                    let mut idx = state.fsindex.lock().unwrap();
-                    if idx.usage_version != model.version {
-                        idx.refresh_usage(&model, now, model.version);
-                    }
-                    let comps = idx.best_components(&abs, wants_dirs(cmd), 3);
-                    drop(idx);
-                    if comps.is_empty() {
-                        out.push_str("; P: none");
-                    } else {
-                        out.push_str(&format!("; P: {}", comps.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(" ")));
-                    }
-                }
-            }
-            out
+            let model = state.model.lock();
+            let mut text = model.explain(payload, cwd, now, prev);
+            let paths = index_predictions(state, &model, cwd, payload, now, 3);
+            text.push_str(&format!("; P: {paths:?}"));
+            text
         }
         "REINDEX" => {
-            let config = Config::load_or_create(&state.home);
-            let fresh = FsIndex::build(&config, &state.home);
-            let _ = fresh.save(&fsindex_path());
-            let n = fresh.paths.len();
-            *state.fsindex.lock().unwrap() = fresh;
-            log(&format!("reindex: {n} paths, mode={}", config.scan.mode));
-            format!("OK paths={n} mode={}", config.scan.mode)
+            let _guard = state.mutations.lock();
+            if state.stopping.load(Ordering::Acquire) { return Err("daemon is shutting down".into()); }
+            format!("OK paths={}", reindex(state)?)
         }
         "STATS" => {
-            let model = state.model.lock().unwrap();
-            let idx = state.fsindex.lock().unwrap();
-            let sessions = state.sessions.lock().unwrap();
-            let bigram_edges: usize = model.bigram.values().map(|m| m.len()).sum();
-            let trigram_edges: usize = model.trigram.values().map(|m| m.len()).sum();
-            format!(
-                "lines={} words={} bigram_edges={} trigram_edges={} cmd_transitions={} fs_paths={} sessions={} predicts={} accepts={}",
-                model.lines.len(),
-                model.vocab.strings.len(),
-                bigram_edges,
-                trigram_edges,
-                model.shape_bigram.len(),
-                idx.paths.len(),
-                sessions.len(),
-                state.predicts.load(Ordering::Relaxed),
-                state.accepts.load(Ordering::Relaxed)
-            )
+            let model = state.model.lock();
+            format!("lines={} words={} bigram_edges={} trigram_edges={} cmd_transitions={} fs_paths={} sessions={} predicts={} accepts={}",
+                model.lines.len(), model.vocab.strings.len(),
+                model.bigram.values().map(|m| m.len()).sum::<usize>(), model.trigram.values().map(|m| m.len()).sum::<usize>(),
+                model.shape_bigram.len(), state.fsindex.lock().paths.len(), state.sessions.lock().len(),
+                state.predicts.load(Ordering::Relaxed), state.accepts.load(Ordering::Relaxed))
         }
-        _ => String::new(),
+        _ => return Err(format!("unknown request kind: {kind}")),
     };
+    Ok(Reply::Text(reply))
+}
 
-    stream.write_all(format!("{reply}\n").as_bytes()).is_ok()
+fn index_predictions(state: &AppState, model: &Model, cwd: &str, partial: &str, now: u64, count: usize) -> Vec<String> {
+    if partial.is_empty() { return Vec::new(); }
+    let last = last_shell_word(partial);
+    let Some(abs) = expand_home(&last, &state.home, Some(cwd)) else { return Vec::new(); };
+    let mut idx = state.fsindex.lock();
+    if idx.usage_version != model.version { idx.refresh_usage(model, now, model.version); }
+    let cmd = partial.split_whitespace().next().unwrap_or("");
+    let candidates = if count == 1 { idx.predict(&abs, wants_dirs(cmd)).into_iter().collect() }
+        else { idx.best_components(&abs, wants_dirs(cmd), count) };
+    candidates.into_iter().filter_map(|suffix| escape_path_suffix(partial, &suffix).map(|suffix| format!("P:{suffix}"))).collect()
 }
 
 fn combined_predict(state: &AppState, cwd: &str, partial: &str, prev_shape: Option<u64>) -> String {
     let now = now_secs();
-    if !partial.is_empty() && !partial.ends_with(' ') {
-        let last = last_shell_word(partial);
-        if let Some(abs) = expand_home(&last, &state.home, Some(cwd)) {
-            let model = state.model.lock().unwrap();
-            let mut idx = state.fsindex.lock().unwrap();
-            if idx.usage_version != model.version {
-                idx.refresh_usage(&model, now, model.version);
-            }
-            let cmd = partial.split_whitespace().next().unwrap_or("");
-            let result = idx.predict(&abs, wants_dirs(cmd));
-            drop(idx);
-            drop(model);
-            if let Some(suffix) = result {
-                return format!("P:{suffix}");
-            }
-            let path_shaped = is_path_shaped(&last);
-            let (tag, suffix) = state.model.lock().unwrap().predict_with(partial, cwd, now, !path_shaped, prev_shape);
-            if tag == '\0' {
-                return String::new();
-            }
-            return format!("{tag}:{suffix}");
-        }
+    let model = state.model.lock();
+    let explicit = is_path_shaped(&last_shell_word(partial));
+    if explicit {
+        if let Some(path) = index_predictions(state, &model, cwd, partial, now, 1).pop() { return path; }
     }
-    let (tag, suffix) = state.model.lock().unwrap().predict_with(partial, cwd, now, true, prev_shape);
-    if tag == '\0' {
-        String::new()
-    } else {
-        format!("{tag}:{suffix}")
-    }
+    let (tag, suffix) = model.predict_with(partial, cwd, now, !explicit, prev_shape);
+    if tag != '\0' && (tag != 'F' || explicit) { return format!("{tag}:{suffix}"); }
+    if let Some(path) = index_predictions(state, &model, cwd, partial, now, 1).pop() { return path; }
+    if tag == '\0' { String::new() } else { format!("{tag}:{suffix}") }
 }
 
-fn try_request(kind: &str, cwd: &str, payload: &str) -> Option<String> {
-    let session = env::var("FORESIGHT_SESSION").unwrap_or_default();
-    let mut stream = UnixStream::connect(sock_path()).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(500))).ok()?;
-    stream.write_all(format!("{kind}\t{cwd}\t{session}\t{payload}\n").as_bytes()).ok()?;
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    Some(line.trim_end_matches('\n').to_string())
-}
-
-fn client_request(kind: &str, cwd: &str, payload: &str) -> Option<String> {
-    if let Some(r) = try_request(kind, cwd, payload) {
-        return Some(r);
+struct Connection { reader: BufReader<UnixStream> }
+impl Connection {
+    fn connect() -> io::Result<Self> {
+        let stream = UnixStream::connect(sock_path())?;
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        Ok(Self { reader: BufReader::new(stream) })
     }
-    spawn_daemon_and_wait();
-    try_request(kind, cwd, payload)
-}
-
-fn spawn_daemon_and_wait() {
-    let exe = match env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    let _ = Command::new(exe)
-        .arg("serve")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
-
-    for _ in 0..40 {
-        thread::sleep(Duration::from_millis(50));
-        if try_request("PING", "", "").as_deref() == Some("PONG") {
-            return;
-        }
+    fn request(&mut self, kind: &str, cwd: &str, payload: &str) -> io::Result<Response> {
+        let request = Request { kind: kind.into(), cwd: cwd.into(), payload: payload.into(), session: env::var("FORESIGHT_SESSION").unwrap_or_default() };
+        protocol::write_json(self.reader.get_mut(), &request)?;
+        protocol::read_json(&mut self.reader)
     }
 }
-
-fn ensure_daemon() {
+fn client_request(kind: &str, cwd: &str, payload: &str) -> Response {
     integrations::materialize_if_stale();
-    if try_request("PING", "", "").as_deref() == Some("PONG") {
-        return;
-    }
-    spawn_daemon_and_wait();
-}
-
-fn run_stream() {
-    use std::io::{BufRead, Write};
-    ensure_daemon();
-
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut input = stdin.lock();
-    let mut line = String::new();
-    let mut stream: Option<UnixStream> = None;
-    let mut buf_reader: Option<BufReader<UnixStream>> = None;
-
-    loop {
-        line.clear();
-        let n = match input.read_line(&mut line) {
-            Ok(n) => n,
-            Err(_) => return,
-        };
-        if n == 0 {
-            return;
+    let mut connection = match Connection::connect() {
+        Ok(connection) => connection,
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+            spawn_daemon_and_wait()?;
+            Connection::connect().map_err(|e| e.to_string())?
         }
-        let line_trimmed = line.trim_end_matches(['\r', '\n']);
-        let (cwd, payload) = match line_trimmed.split_once('\t') {
-            Some((c, p)) => (c.to_string(), p),
-            None => {
-                let c = env::var("FORESIGHT_CWD")
-                    .or_else(|_| env::var("PWD"))
-                    .unwrap_or_default();
-                (c, line_trimmed)
-            }
-        };
-        let session = env::var("FORESIGHT_SESSION").unwrap_or_default();
-        let mut attempts = 0u8;
-        let reply = loop {
-            attempts += 1;
-            if stream.is_none() {
-                if let Ok(s) = UnixStream::connect(sock_path()) {
-                    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
-                    match s.try_clone() {
-                        Ok(clone) => buf_reader = Some(BufReader::new(clone)),
-                        Err(_) => { stream = None; continue; }
-                    }
-                    stream = Some(s);
-                } else {
-                    spawn_daemon_and_wait();
-                    if attempts >= 2 { break String::new(); }
-                    continue;
-                }
-            }
-            let s = stream.as_mut().unwrap();
-            let write = format!("P\t{cwd}\t{session}\t{payload}\n").into_bytes();
-            if s.write_all(&write).is_err() {
-                stream = None;
-                buf_reader = None;
-                if attempts >= 3 { break String::new(); }
-                continue;
-            }
-            let r = buf_reader.as_mut().unwrap();
-            let mut reply_line = String::new();
-            if r.read_line(&mut reply_line).is_err() {
-                stream = None;
-                buf_reader = None;
-                if attempts >= 3 { break String::new(); }
-                continue;
-            }
-            let trimmed = reply_line.trim_end_matches('\n').to_string();
-            break strip_tag(&trimmed).to_string();
-        };
-        if out.write_all(reply.as_bytes()).is_err() { return; }
-        if out.write_all(b"\n").is_err() { return; }
-        if out.flush().is_err() { return; }
-    }
-}
-
-#[cfg(feature = "bench")]
-struct Xorshift64(u64);
-#[cfg(feature = "bench")]
-impl Xorshift64 {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-    fn range(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
-#[cfg(feature = "bench")]
-fn snap_to_char_boundary(s: &str, mut i: usize) -> usize {
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-#[cfg(feature = "bench")]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Category {
-    Line,
-    PathGeneral,
-    PathUsed,
-}
-
-#[cfg(feature = "bench")]
-impl Category {
-    fn idx(self) -> usize {
-        match self {
-            Category::Line => 0,
-            Category::PathGeneral => 1,
-            Category::PathUsed => 2,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Category::Line => "commands",
-            Category::PathGeneral => "paths (never typed)",
-            Category::PathUsed => "paths (previously typed)",
-        }
-    }
-}
-
-#[cfg(feature = "bench")]
-#[derive(Default, Clone, Copy)]
-struct Tally {
-    total: u64,
-    offered: u64,
-    correct: u64,
-    exact: u64,
-}
-
-#[cfg(feature = "bench")]
-impl Tally {
-    fn report(&self, label: &str) {
-        if self.total == 0 {
-            return;
-        }
-        println!(
-            "  {:<26} n={:<8} coverage={:>5.1}%  accuracy={:>5.1}%  exact={:>5.1}%",
-            label,
-            self.total,
-            self.offered as f64 / self.total as f64 * 100.0,
-            self.correct as f64 / self.total as f64 * 100.0,
-            self.exact as f64 / self.total as f64 * 100.0,
-        );
-    }
-}
-
-#[cfg(feature = "bench")]
-struct Query {
-    text: String,
-    true_suffix: String,
-    category: Category,
-    line_idx: Option<usize>,
-    prev_shape: Option<u64>,
-}
-
-#[cfg(feature = "bench")]
-fn build_query_pool(model: &Model, fsindex: &FsIndex) -> Vec<Query> {
-    let mut rng = Xorshift64(0x9e3779b97f4a7c15);
-    let mut pool = Vec::new();
-
-    let hist: Vec<String> = std::fs::read_to_string(history_path())
-        .map(|t| t.lines().map(str::to_string).collect())
-        .unwrap_or_default();
-    let mut first_at: HashMap<&str, usize> = HashMap::new();
-    for (i, h) in hist.iter().enumerate() {
-        first_at.entry(h.as_str()).or_insert(i);
-    }
-
-    for (idx, entry) in model.lines.iter().enumerate() {
-        if entry.text.len() < 2 {
-            continue;
-        }
-        let cut = snap_to_char_boundary(&entry.text, 1 + rng.range(entry.text.len() - 1));
-        let prev_shape = first_at
-            .get(entry.text.as_str())
-            .and_then(|&i| i.checked_sub(1))
-            .map(|i| line_shape(&hist[i]));
-        pool.push(Query {
-            text: entry.text[..cut].to_string(),
-            true_suffix: entry.text[cut..].to_string(),
-            category: Category::Line,
-            line_idx: Some(idx),
-            prev_shape,
-        });
-    }
-
-    let step = (fsindex.paths.len() / 1000).max(1);
-    for (p, _) in fsindex.paths.iter().step_by(step) {
-        if p.is_empty() || p.len() < 2 || p.contains(char::is_whitespace) {
-            continue;
-        }
-        let cut = snap_to_char_boundary(p, 1 + rng.range(p.len() - 1));
-        pool.push(Query {
-            text: p[..cut].to_string(),
-            true_suffix: p[cut..].to_string(),
-            category: Category::PathGeneral,
-            line_idx: None,
-            prev_shape: None,
-        });
-    }
-
-    for (path, _) in model.path_freq.iter() {
-        if path.is_empty() || path.len() < 2 || path.contains(char::is_whitespace) || !fsindex.contains(path) {
-            continue;
-        }
-        let cut = snap_to_char_boundary(path, 1 + rng.range(path.len() - 1));
-        pool.push(Query {
-            text: path[..cut].to_string(),
-            true_suffix: path[cut..].to_string(),
-            category: Category::PathUsed,
-            line_idx: None,
-            prev_shape: None,
-        });
-    }
-
-    if pool.is_empty() {
-        pool.push(Query { text: String::new(), true_suffix: String::new(), category: Category::Line, line_idx: None, prev_shape: None });
-    }
-    pool
-}
-
-#[cfg(feature = "bench")]
-fn zsh_predict(text: &str, lines: &[&str]) -> Option<String> {
-    if text.is_empty() {
-        return None;
-    }
-    lines.iter().rev().find(|line| **line != text && line.starts_with(text)).map(|line| line[text.len()..].to_string())
-}
-
-#[cfg(feature = "bench")]
-fn percentile_ns(sorted: &[u128], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = (((p / 100.0) * (sorted.len() - 1) as f64).round() as usize).min(sorted.len() - 1);
-    sorted[idx] as f64
-}
-
-#[cfg(feature = "bench")]
-fn parse_reply(reply: &str) -> (char, &str) {
-    let b = reply.as_bytes();
-    if b.len() >= 2 && b[1] == b':' && matches!(b[0], b'L' | b'T' | b'B' | b'W' | b'F' | b'P') {
-        (b[0] as char, &reply[2..])
-    } else {
-        ('\0', reply)
-    }
-}
-
-#[cfg(feature = "bench")]
-fn run_bench(n: u64) {
-    let model = Model::load(&model_path()).unwrap_or_default();
-    let fsindex = FsIndex::load(&fsindex_path()).unwrap_or_else(|_| FsIndex::empty());
-    let pool = build_query_pool(&model, &fsindex);
-    eprintln!(
-        "query pool: {} samples (from {} history lines, {} indexed paths)",
-        pool.len(),
-        model.lines.len(),
-        fsindex.paths.len()
-    );
-
-    let mut stream = match UnixStream::connect(sock_path()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot connect to daemon - is it running? try: foresight ensure-daemon ({e})");
-            return;
-        }
+        Err(e) => return Err(e.to_string()),
     };
-    let read_half = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot clone socket: {e}");
-            return;
+    // Never retry an ambiguously acknowledged mutation.
+    connection.request(kind, cwd, payload).map_err(|e| e.to_string())?
+}
+fn notify_running(kind: &str) -> Result<(), String> {
+    match Connection::connect() {
+        Ok(mut connection) => { connection.request(kind, "", "").map_err(|e| e.to_string())??; Ok(()) }
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+fn spawn_daemon_and_wait() -> Result<(), String> {
+    Command::new(env::current_exe().map_err(|e| e.to_string())?).arg("serve")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0)
+        .spawn().map_err(|e| e.to_string())?;
+    for _ in 0..100 {
+        thread::sleep(Duration::from_millis(50));
+        if let Ok(mut connection) = Connection::connect() {
+            if matches!(connection.request("PING", "", ""), Ok(Ok(Reply::Text(text))) if text == "PONG") { return Ok(()); }
         }
-    };
-    let mut reader = BufReader::new(read_half);
-
-    let mut overall = Tally::default();
-    let mut by_cat = [Tally::default(); 3];
-    let mut holdout = Tally::default();
-    let mut seq_off = Tally::default();
-    let mut by_strategy: HashMap<char, Tally> = HashMap::new();
-
-    let all_lines: Vec<&str> = model.lines.iter().map(|e| e.text.as_str()).collect();
-    let mut zsh_overall = Tally::default();
-    let mut zsh_by_cat = [Tally::default(); 3];
-
-    let sample_every = (n / 2000).max(1);
-    let mut sample_latencies_ns: Vec<u128> = Vec::with_capacity(2000);
-    let mut line_buf = String::new();
-    let mut holdout_buf = String::new();
-    let mut abl_buf = String::new();
-    let mut requests_sent: u64 = 0;
-
-    let t_start = Instant::now();
-    for i in 0..n {
-        let query = &pool[(i as usize) % pool.len()];
-        let timed = i % sample_every == 0;
-        let req_start = if timed { Some(Instant::now()) } else { None };
-
-        let cwd = query.line_idx.and_then(|idx| model.top_cwd(idx)).unwrap_or("");
-        let seq_field = query.prev_shape.map_or(String::new(), |p| format!("#{p:x}"));
-        if stream.write_all(format!("P\t{cwd}\t{seq_field}\t{}\n", query.text).as_bytes()).is_err() {
-            eprintln!("write failed at request {i} - daemon may have died");
-            break;
+    }
+    Err("daemon did not become ready".into())
+}
+fn ensure_daemon() -> Result<(), String> {
+    integrations::materialize_if_stale();
+    match Connection::connect() {
+        Ok(mut connection) => {
+            let reply = text_reply(connection.request("PING", "", "").map_err(|e| e.to_string())??)?;
+            if reply == "PONG" { Ok(()) } else { Err("invalid daemon ping reply".into()) }
         }
-        requests_sent += 1;
-        line_buf.clear();
-        if reader.read_line(&mut line_buf).is_err() {
-            eprintln!("read failed at request {i} - daemon may have died");
-            break;
-        }
-        if let Some(t0) = req_start {
-            sample_latencies_ns.push(t0.elapsed().as_nanos());
-        }
-        let (tag, suggestion) = parse_reply(line_buf.trim_end_matches('\n'));
-        if tag == 'W' && std::env::var_os("FORESIGHT_DEBUG_W").is_some() {
-            eprintln!("W-debug: query={:?} truth={:?}", query.text, query.true_suffix);
-        }
-        let cat = &mut by_cat[query.category.idx()];
-        overall.total += 1;
-        cat.total += 1;
-        if !suggestion.is_empty() {
-            overall.offered += 1;
-            cat.offered += 1;
-            if query.true_suffix.starts_with(suggestion) {
-                overall.correct += 1;
-                cat.correct += 1;
-                if suggestion == query.true_suffix {
-                    overall.exact += 1;
-                    cat.exact += 1;
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => spawn_daemon_and_wait(),
+        Err(e) => Err(e.to_string()),
+    }
+}
+fn run_stream() -> Result<(), String> {
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    let mut connection = None;
+    while let Some(cwd) = protocol::read_nul(&mut input).map_err(|e| e.to_string())? {
+        let payload = protocol::read_nul(&mut input).map_err(|e| e.to_string())?.ok_or("stream ended without payload")?;
+        let mut reply = None;
+        for attempt in 0..2 {
+            if connection.is_none() {
+                ensure_daemon()?;
+                connection = Some(Connection::connect().map_err(|e| e.to_string())?);
+            }
+            match connection.as_mut().unwrap().request("P", &cwd, &payload) {
+                Ok(response) => { reply = Some(text_reply(response?)?); break; }
+                Err(e) => {
+                    connection = None;
+                    if attempt == 1 { return Err(e.to_string()); }
                 }
             }
         }
-        if tag != '\0' {
-            let s = by_strategy.entry(tag).or_default();
-            s.total += 1;
-            if !suggestion.is_empty() {
-                s.offered += 1;
-                if query.true_suffix.starts_with(suggestion) {
-                    s.correct += 1;
-                    if suggestion == query.true_suffix {
-                        s.exact += 1;
-                    }
+        let reply = reply.ok_or("prediction transport failed")?;
+        output.write_all(strip_tag(&reply).as_bytes()).map_err(|e| e.to_string())?;
+        output.write_all(b"\0").map_err(|e| e.to_string())?;
+        output.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bench")]
+fn run_bench(n: u64) -> Result<(), String> {
+    use std::time::Instant;
+    let home = env::var("HOME").map_err(|e| e.to_string())?;
+    let history = std::fs::read_to_string(history_path()).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = history.lines().filter(|line| !line.trim().is_empty() && !line.starts_with('#')).collect();
+    if !lines.iter().any(|line| line.chars().count() >= 2) { return Err("history has no replayable commands".into()); }
+    let mut performed = 0u64;
+    let mut model_correct = 0u64;
+    let mut baseline_correct = 0u64;
+    let mut model_offered = 0u64;
+    let mut baseline_offered = 0u64;
+    let start = Instant::now();
+    while performed < n {
+        // Every pass starts empty. Repetitions within the chronological history
+        // are observations, never collapsed into a unique-command set.
+        let mut model = Model::default();
+        let mut prior = Vec::<&str>::new();
+        let mut prev = None;
+        for (i, line) in lines.iter().enumerate() {
+            let now = i as u64 + 1;
+            if let Some((cut, _)) = line.char_indices().nth(line.chars().count() / 2).filter(|(cut, _)| *cut > 0) {
+                let prefix = &line[..cut];
+                let truth = &line[cut..];
+                let (tag, suffix) = model.predict_with(prefix, &home, now, true, prev);
+                if tag != '\0' && !suffix.is_empty() {
+                    model_offered += 1;
+                    model_correct += u64::from(truth.starts_with(&suffix));
                 }
-            }
-        }
-
-        if let Some(idx) = query.line_idx {
-            if stream.write_all(format!("PH\t{cwd}\t{seq_field}\t{idx}\t{}\n", query.text).as_bytes()).is_err() {
-                eprintln!("holdout write failed at request {i}");
-                break;
-            }
-            requests_sent += 1;
-            holdout_buf.clear();
-            if reader.read_line(&mut holdout_buf).is_err() {
-                eprintln!("holdout read failed at request {i}");
-                break;
-            }
-            let (_, h_suggestion) = parse_reply(holdout_buf.trim_end_matches('\n'));
-            holdout.total += 1;
-            if !h_suggestion.is_empty() {
-                holdout.offered += 1;
-                if query.true_suffix.starts_with(h_suggestion) {
-                    holdout.correct += 1;
-                    if h_suggestion == query.true_suffix {
-                        holdout.exact += 1;
-                    }
+                if let Some(candidate) = prior.iter().rev().find(|candidate| **candidate != prefix && candidate.starts_with(prefix)) {
+                    baseline_offered += 1;
+                    baseline_correct += u64::from(truth.starts_with(&candidate[prefix.len()..]));
                 }
+                performed += 1;
+                if performed == n { break; }
             }
-
-            if stream.write_all(format!("P\t{cwd}\t\t{}\n", query.text).as_bytes()).is_err() {
-                eprintln!("ablation write failed at request {i}");
-                break;
-            }
-            requests_sent += 1;
-            abl_buf.clear();
-            if reader.read_line(&mut abl_buf).is_err() {
-                eprintln!("ablation read failed at request {i}");
-                break;
-            }
-            let (_, off_suggestion) = parse_reply(abl_buf.trim_end_matches('\n'));
-            seq_off.total += 1;
-            if !off_suggestion.is_empty() {
-                seq_off.offered += 1;
-                if query.true_suffix.starts_with(off_suggestion) {
-                    seq_off.correct += 1;
-                    if off_suggestion == query.true_suffix {
-                        seq_off.exact += 1;
-                    }
-                }
-            }
-        }
-
-        let zsh_lines: &[&str] = match query.line_idx {
-            Some(idx) => &all_lines[..idx],
-            None => &all_lines[..],
-        };
-        let zsh_suggestion = zsh_predict(&query.text, zsh_lines);
-        let zcat = &mut zsh_by_cat[query.category.idx()];
-        zsh_overall.total += 1;
-        zcat.total += 1;
-        if let Some(s) = &zsh_suggestion {
-            zsh_overall.offered += 1;
-            zcat.offered += 1;
-            if query.true_suffix.starts_with(s.as_str()) {
-                zsh_overall.correct += 1;
-                zcat.correct += 1;
-                if *s == query.true_suffix {
-                    zsh_overall.exact += 1;
-                    zcat.exact += 1;
-                }
-            }
-        }
-
-        if i > 0 && i % 100_000 == 0 {
-            eprintln!("  {i}/{n}...");
+            model.train(line, &home, &home, now);
+            let shape = line_shape(line);
+            if let Some(previous) = prev { model.record_transition(previous, shape, now); }
+            prev = Some(shape);
+            prior.push(line);
         }
     }
-    let elapsed = t_start.elapsed();
-
-    sample_latencies_ns.sort_unstable();
-    let p50 = percentile_ns(&sample_latencies_ns, 50.0);
-    let p99 = percentile_ns(&sample_latencies_ns, 99.0);
-
-    println!();
-    println!("iterations:  {n}");
-    println!("requests:    {requests_sent} (line queries also run holdout + no-seq ablation)");
-    println!("elapsed:     {:.2}s", elapsed.as_secs_f64());
-    println!("throughput:  {:.0} req/s", requests_sent as f64 / elapsed.as_secs_f64());
-    println!("avg latency: {:.2} us", elapsed.as_secs_f64() * 1_000_000.0 / requests_sent as f64);
-    println!(
-        "p50 latency: {:.2} us (sampled, n={})",
-        p50 / 1000.0,
-        sample_latencies_ns.len()
-    );
-    println!("p99 latency: {:.2} us (sampled)", p99 / 1000.0);
-
-    if let Ok(exe) = env::current_exe() {
-        let mut e2e_total = Duration::ZERO;
-        let runs = 5u32;
-        for _ in 0..runs {
-            let t0 = Instant::now();
-            let _ = Command::new(&exe).arg("predict").arg("git st").stdout(Stdio::null()).stderr(Stdio::null()).status();
-            e2e_total += t0.elapsed();
-        }
-        println!("client e2e:  {:.2} ms avg (fork+exec+socket, {runs} runs)", e2e_total.as_secs_f64() * 1000.0 / runs as f64);
+    println!("offline chronological replay; identical prior observations; no daemon requests");
+    println!("iterations: {performed}\nelapsed: {:.3}s", start.elapsed().as_secs_f64());
+    for (name, offered, correct) in [("foresight", model_offered, model_correct), ("zsh-autosuggestions", baseline_offered, baseline_correct)] {
+        println!("{name}: coverage={:.2}% accuracy={:.2}% ({correct}/{performed})", offered as f64 * 100.0 / performed as f64, correct as f64 * 100.0 / performed as f64);
     }
-
-    println!();
-    println!(
-        "coverage:    {:.1}% ({}/{n} got any suggestion)",
-        overall.offered as f64 / n as f64 * 100.0,
-        overall.offered
-    );
-    println!(
-        "accuracy:    {:.1}% ({}/{n} suggestions matched what actually came next)",
-        overall.correct as f64 / n as f64 * 100.0,
-        overall.correct
-    );
-    println!(
-        "precision:   {:.1}% ({}/{} of offered suggestions were correct)",
-        if overall.offered > 0 { overall.correct as f64 / overall.offered as f64 * 100.0 } else { 0.0 },
-        overall.correct,
-        overall.offered
-    );
-    println!(
-        "exact match: {:.1}% ({}/{n} completed the rest of the text exactly)",
-        overall.exact as f64 / n as f64 * 100.0,
-        overall.exact
-    );
-    println!();
-    println!("by category:");
-    for cat in [Category::Line, Category::PathGeneral, Category::PathUsed] {
-        by_cat[cat.idx()].report(cat.label());
-    }
-    holdout.report("commands (holdout)");
-    if seq_off.total > 0 {
-        println!();
-        println!("sequence bonus (same command queries, prev-command context):");
-        by_cat[Category::Line.idx()].report("  with ctx (live behavior)");
-        seq_off.report("  without ctx (ablation)");
-    }
-
-    println!();
-    println!("by strategy (which predictor produced the reply):");
-    for (tag, label) in [
-        ('L', "line continuation"),
-        ('T', "trigram"),
-        ('B', "bigram"),
-        ('W', "word prefix"),
-        ('P', "path component"),
-        ('F', "filesystem completion"),
-    ] {
-        if let Some(s) = by_strategy.get(&tag) {
-            s.report(label);
-        }
-    }
-
-    println!();
-    println!("--- zsh-autosuggestions baseline (same query pool, same ground truth) ---");
-    println!(
-        "coverage:    {:.1}% ({}/{n})",
-        zsh_overall.offered as f64 / n as f64 * 100.0,
-        zsh_overall.offered
-    );
-    println!(
-        "accuracy:    {:.1}% ({}/{n})",
-        zsh_overall.correct as f64 / n as f64 * 100.0,
-        zsh_overall.correct
-    );
-    println!(
-        "precision:   {:.1}% ({}/{})",
-        if zsh_overall.offered > 0 { zsh_overall.correct as f64 / zsh_overall.offered as f64 * 100.0 } else { 0.0 },
-        zsh_overall.correct,
-        zsh_overall.offered
-    );
-    println!(
-        "exact match: {:.1}% ({}/{n})",
-        zsh_overall.exact as f64 / n as f64 * 100.0,
-        zsh_overall.exact
-    );
-    println!("by category:");
-    for cat in [Category::Line, Category::PathGeneral, Category::PathUsed] {
-        zsh_by_cat[cat.idx()].report(cat.label());
-    }
+    Ok(())
 }

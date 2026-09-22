@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use parking_lot::Mutex;
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
 use crate::config::Config;
-use crate::util::{data_dir, fnv1a64, log};
+use crate::util::{atomic_write, data_dir, fnv1a64, log};
 
 const MAGIC: &[u8; 4] = b"BPFS";
 
@@ -26,67 +29,6 @@ impl FsIndex {
         FsIndex { paths: Vec::new(), usage: Vec::new(), usage_version: 0 }
     }
 
-    pub fn build(config: &Config, home: &str) -> FsIndex {
-        let cap = config.max_entries();
-        let (exclude_names, exclude_paths) = config.effective_excludes();
-        let own_data_dir = data_dir().to_string_lossy().to_string();
-        let mut paths = Vec::new();
-        let mut truncated = false;
-
-        'roots: for root in config.resolved_roots(home) {
-            let mut stack = vec![PathBuf::new()];
-            while let Some(rel) = stack.pop() {
-                if paths.len() >= cap {
-                    truncated = true;
-                    break 'roots;
-                }
-                let abs_dir = root.join(&rel);
-                let Ok(entries) = fs::read_dir(&abs_dir) else { continue };
-                for entry in entries.flatten() {
-                    if paths.len() >= cap {
-                        truncated = true;
-                        break 'roots;
-                    }
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if exclude_names.iter().any(|n| n == &name) {
-                        continue;
-                    }
-                    let Ok(file_type) = entry.file_type() else { continue };
-
-                    let child_rel = if rel.as_os_str().is_empty() { PathBuf::from(&name) } else { rel.join(&name) };
-                    let child_rel_str = child_rel.to_string_lossy().to_string();
-                    if exclude_paths.iter().any(|p| child_rel_str == *p || child_rel_str.starts_with(&format!("{p}/"))) {
-                        continue;
-                    }
-
-                    let is_symlink = file_type.is_symlink();
-                    let is_dir = if is_symlink {
-                        fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false)
-                    } else {
-                        file_type.is_dir()
-                    };
-                    let abs_str = root.join(&child_rel).to_string_lossy().to_string();
-                    if abs_str == own_data_dir || abs_str.starts_with(&format!("{own_data_dir}/")) {
-                        continue;
-                    }
-                    paths.push((abs_str, is_dir));
-                    if is_dir && !is_symlink {
-                        stack.push(child_rel);
-                    }
-                }
-            }
-        }
-
-        if truncated {
-            log(&format!(
-                "fs index hit the {cap}-entry cap ({} mode) and stopped early - index is partial",
-                config.scan.mode
-            ));
-        }
-
-        paths.sort();
-        FsIndex { paths, usage: Vec::new(), usage_version: 0 }
-    }
 
     #[cfg(any(test, feature = "bench"))]
     pub fn contains(&self, abs: &str) -> bool {
@@ -98,103 +40,53 @@ impl FsIndex {
         self.apply_batch(vec![], vec![abs.to_string()]);
     }
 
-    fn insert_one(&mut self, abs: String, is_dir: bool) {
-        match self.paths.binary_search_by(|(p, _)| p.as_str().cmp(abs.as_str())) {
-            Ok(i) => self.paths[i].1 = is_dir,
-            Err(i) => {
-                self.paths.insert(i, (abs, is_dir));
-                self.usage.insert(i, 0.0);
-            }
-        }
-    }
-
-    fn remove_one(&mut self, abs: &str) {
-        if let Ok(i) = self.paths.binary_search_by(|(p, _)| p.as_str().cmp(abs)) {
-            self.paths.remove(i);
-            self.usage.remove(i);
-        }
-        let prefix = format!("{abs}/");
-        let start = self.paths.partition_point(|(p, _)| p.as_str() < prefix.as_str());
-        let mut end = start;
-        while end < self.paths.len() && self.paths[end].0.starts_with(&prefix) {
-            end += 1;
-        }
-        if end > start {
-            self.paths.drain(start..end);
-            self.usage.drain(start..end);
-        }
-    }
-
-    pub fn apply_batch(&mut self, insert: Vec<(String, bool)>, remove: Vec<String>) {
-        if self.usage.len() != self.paths.len() {
-            self.usage.resize(self.paths.len(), 0.0);
-        }
-        if insert.len() + remove.len() <= 32 {
-            for (abs, is_dir) in insert {
-                self.insert_one(abs, is_dir);
-            }
-            for r in remove {
-                self.remove_one(&r);
-            }
-            return;
-        }
-
-        let mut remove = remove;
-        let mut insert = insert;
+    pub fn apply_batch(&mut self, mut insert: Vec<(String, bool)>, mut remove: Vec<String>) {
+        if insert.is_empty() && remove.is_empty() { return; }
+        self.usage.resize(self.paths.len(), 0.0);
         remove.sort();
         remove.dedup();
-        let rm = &remove;
-        insert.retain(|(p, _)| !rm.iter().any(|r| p == r || p.starts_with(&format!("{r}/"))));
-        let ranges = Self::removal_ranges(&self.paths, &remove);
-        if !ranges.is_empty() {
-            let mut kept = Vec::with_capacity(self.paths.len());
-            let mut kept_usage = Vec::with_capacity(self.usage.len());
-            let mut ri = 0;
-            for (i, item) in self.paths.drain(..).enumerate() {
-                while ri < ranges.len() && ranges[ri].1 <= i {
-                    ri += 1;
-                }
-                let in_range = ri < ranges.len() && i >= ranges[ri].0;
-                if !in_range {
-                    kept_usage.push(self.usage[i]);
-                    kept.push(item);
-                }
-            }
-            self.usage = kept_usage;
-            self.paths = kept;
-        }
-
-        if insert.is_empty() {
-            return;
-        }
+        insert.retain(|(path, _)| !Path::new(path).ancestors().any(|ancestor| {
+            ancestor.to_str().is_some_and(|p| remove.binary_search_by(|r| r.as_str().cmp(p)).is_ok())
+        }));
         insert.sort();
         insert.dedup_by(|a, b| a.0 == b.0);
-
-        let mut merged: Vec<(String, bool)> = Vec::with_capacity(self.paths.len() + insert.len());
-        let mut merged_usage: Vec<f64> = Vec::with_capacity(self.usage.len() + insert.len());
-        let mut ai = 0;
-        let mut bi = 0;
-        while ai < self.paths.len() || bi < insert.len() {
-            let take_b = ai >= self.paths.len()
-                || (bi < insert.len() && insert[bi].0.as_str() < self.paths[ai].0.as_str());
-            let same = ai < self.paths.len() && bi < insert.len() && insert[bi].0 == self.paths[ai].0;
-            if same {
-                merged.push(insert[bi].clone());
-                merged_usage.push(self.usage[ai]);
-                ai += 1;
-                bi += 1;
-            } else if take_b {
-                merged.push(insert[bi].clone());
-                merged_usage.push(0.0);
-                bi += 1;
-            } else {
-                merged.push(self.paths[ai].clone());
-                merged_usage.push(self.usage[ai]);
-                ai += 1;
+        let ranges = Self::removal_ranges(&self.paths, &remove);
+        let capacity = self.paths.len() + insert.len();
+        let old = std::mem::take(&mut self.paths);
+        let scores = std::mem::take(&mut self.usage);
+        let mut range = 0;
+        let mut old = old.into_iter().zip(scores).enumerate().filter_map(|(i, entry)| {
+            while range < ranges.len() && ranges[range].1 <= i { range += 1; }
+            if range < ranges.len() && i >= ranges[range].0 { None } else { Some(entry) }
+        }).peekable();
+        let mut insert = insert.into_iter().peekable();
+        let mut paths = Vec::with_capacity(capacity);
+        let mut usage = Vec::with_capacity(capacity);
+        while old.peek().is_some() || insert.peek().is_some() {
+            let order = match (old.peek(), insert.peek()) {
+                (Some((a, _)), Some(b)) => a.0.cmp(&b.0),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, _) => std::cmp::Ordering::Greater,
+            };
+            match order {
+                std::cmp::Ordering::Less => {
+                    let (path, score) = old.next().unwrap();
+                    paths.push(path);
+                    usage.push(score);
+                }
+                std::cmp::Ordering::Equal => {
+                    let (_, score) = old.next().unwrap();
+                    paths.push(insert.next().unwrap());
+                    usage.push(score);
+                }
+                std::cmp::Ordering::Greater => {
+                    paths.push(insert.next().unwrap());
+                    usage.push(0.0);
+                }
             }
         }
-        self.paths = merged;
-        self.usage = merged_usage;
+        self.paths = paths;
+        self.usage = usage;
     }
 
     fn removal_ranges(paths: &[(String, bool)], remove: &[String]) -> Vec<(usize, usize)> {
@@ -387,15 +279,11 @@ impl FsIndex {
         }
 
         let checksum = fnv1a64(&body);
-        let tmp = path.with_extension("bin.tmp");
-        {
-            let mut w = BufWriter::new(File::create(&tmp)?);
+        atomic_write(path, |w| {
             w.write_all(MAGIC)?;
             w.write_all(&body)?;
-            w.write_all(&checksum.to_le_bytes())?;
-            w.flush()?;
-        }
-        fs::rename(tmp, path)
+            w.write_all(&checksum.to_le_bytes())
+        })
     }
 
     pub fn load(path: &Path) -> io::Result<FsIndex> {
@@ -462,91 +350,213 @@ fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
-pub fn watch(index: Arc<Mutex<FsIndex>>, root: PathBuf, exclude_names: Vec<String>, exclude_paths: Vec<String>) {
-    let mut inotify = match Inotify::init() {
-        Ok(i) => i,
-        Err(e) => {
-            log(&format!("inotify init failed, live index disabled: {e}"));
-            return;
-        }
-    };
+/// Owns the only writer of live filesystem events. Drop before replacing the
+/// index/configuration; joining never takes place under the index mutex.
+pub struct Watcher {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
 
-    let mask = WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_FROM | WatchMask::MOVED_TO;
-    let mut wd_to_abs: HashMap<WatchDescriptor, String> = HashMap::new();
-    let own_data_dir = data_dir().to_string_lossy().to_string();
-    let added = std::cell::Cell::new(0usize);
-    let failed = std::cell::Cell::new(0usize);
-
-    let add_watch = |inotify: &mut Inotify, abs: &Path, wd_to_abs: &mut HashMap<WatchDescriptor, String>| {
-        match inotify.watches().add(abs, mask) {
-            Ok(wd) => {
-                wd_to_abs.insert(wd, abs.to_string_lossy().to_string());
-                added.set(added.get() + 1);
-            }
-            Err(_) => failed.set(failed.get() + 1),
-        }
-    };
-
-    add_watch(&mut inotify, &root, &mut wd_to_abs);
-    let root_str = root.to_string_lossy().to_string();
-    {
-        let idx = index.lock().unwrap();
-        for (p, is_dir) in &idx.paths {
-            if *is_dir && p.starts_with(&root_str) && !Path::new(p).is_symlink() {
-                add_watch(&mut inotify, Path::new(p), &mut wd_to_abs);
-            }
-        }
-    }
-    if failed.get() > 0 {
-        log(&format!(
-            "inotify: {} watches added, {} failed under {root_str} - consider raising fs.inotify.max_user_watches",
-            added.get(),
-            failed.get()
-        ));
-    }
-
-    let mut buffer = [0u8; 4096];
-    loop {
-        let events = match inotify.read_events_blocking(&mut buffer) {
-            Ok(e) => e,
-            Err(e) => {
-                log(&format!("inotify read error, live index stopped: {e}"));
-                return;
-            }
-        };
-
-        let mut inserts: Vec<(String, bool)> = Vec::new();
-        let mut removes: Vec<String> = Vec::new();
-        for event in events {
-            let Some(name) = event.name else { continue };
-            let name = name.to_string_lossy().to_string();
-            let Some(parent_abs) = wd_to_abs.get(&event.wd).cloned() else { continue };
-            let abs = format!("{parent_abs}/{name}");
-            let rel = abs.strip_prefix(&format!("{root_str}/")).unwrap_or(&abs).to_string();
-
-            if abs == own_data_dir
-                || abs.starts_with(&format!("{own_data_dir}/"))
-                || exclude_names.iter().any(|n| n == &name)
-                || exclude_paths.iter().any(|p| rel == *p || rel.starts_with(&format!("{p}/")))
-            {
-                continue;
-            }
-
-            if event.mask.contains(EventMask::CREATE) || event.mask.contains(EventMask::MOVED_TO) {
-                let path = Path::new(&abs);
-                let is_symlink = path.is_symlink();
-                let is_dir = path.is_dir();
-                inserts.push((abs.clone(), is_dir));
-                if is_dir && !is_symlink {
-                    add_watch(&mut inotify, path, &mut wd_to_abs);
+impl Watcher {
+    pub fn start(index: Arc<Mutex<FsIndex>>, config: Config, home: &str) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut live = LiveIndex::new(config, home, stop.clone())?;
+        let fresh = live.rebuild()?;
+        *index.lock() = fresh;
+        let thread = thread::spawn(move || {
+            let mut buffer = [0u8; 65536];
+            while !live.stop.load(Ordering::Acquire) {
+                match live.inotify.read_events(&mut buffer) {
+                    Ok(events) => {
+                        let mut overflow = false;
+                        let mut changes = Vec::new();
+                        for event in events {
+                            if event.mask.contains(EventMask::Q_OVERFLOW) {
+                                overflow = true;
+                            }
+                            if event.mask.contains(EventMask::IGNORED) {
+                                live.watches.remove(&event.wd);
+                                continue;
+                            }
+                            if let Some(parent) = live.watches.get(&event.wd) {
+                                let path = event.name.map_or_else(|| parent.clone(), |name| parent.join(name));
+                                changes.push((path, event.name.is_none() || event.mask.contains(EventMask::ISDIR)));
+                            }
+                        }
+                        if overflow {
+                            match live.rebuild() {
+                                Ok(fresh) => *index.lock() = fresh,
+                                Err(e) => log(&format!("fs index overflow resync failed: {e}")),
+                            }
+                        } else {
+                            live.reconcile_batch(&index, changes);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => {
+                        log(&format!("inotify read failed: {e}"));
+                        match live.rebuild() {
+                            Ok(fresh) => *index.lock() = fresh,
+                            Err(e) => {
+                                log(&format!("fs index resync failed: {e}"));
+                                thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                    }
                 }
-            } else if event.mask.contains(EventMask::DELETE) || event.mask.contains(EventMask::MOVED_FROM) {
-                removes.push(abs);
+            }
+        });
+        Ok(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct LiveIndex {
+    inotify: Inotify,
+    watches: HashMap<WatchDescriptor, PathBuf>,
+    roots: Vec<PathBuf>,
+    names: Vec<String>,
+    excludes: Vec<String>,
+    own_data: PathBuf,
+    cap: usize,
+    stop: Arc<AtomicBool>,
+}
+
+impl LiveIndex {
+    fn new(config: Config, home: &str, stop: Arc<AtomicBool>) -> io::Result<Self> {
+        let (names, excludes) = config.effective_excludes();
+        Ok(Self {
+            inotify: Inotify::init()?, watches: HashMap::new(),
+            roots: config.resolved_roots(home), names, excludes,
+            own_data: data_dir(), cap: config.max_entries(), stop,
+        })
+    }
+
+    fn allowed(&self, path: &Path) -> bool {
+        if path.starts_with(&self.own_data) {
+            return false;
+        }
+        self.roots.iter().any(|root| {
+            let Ok(rel) = path.strip_prefix(root) else { return false };
+            !rel.components().any(|c| self.names.iter().any(|n| c.as_os_str() == std::ffi::OsStr::new(n)))
+                && !self.excludes.iter().any(|p| rel.starts_with(p))
+        })
+    }
+
+    fn add_watch(&mut self, path: &Path) {
+        let mask = WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_FROM
+            | WatchMask::MOVED_TO | WatchMask::DELETE_SELF | WatchMask::MOVE_SELF;
+        match self.inotify.watches().add(path, mask) {
+            Ok(wd) => { self.watches.insert(wd, path.to_path_buf()); }
+            Err(e) => log(&format!("cannot watch {}: {e}", path.display())),
+        }
+    }
+
+    fn scan(&mut self, path: &Path, include_self: bool, budget: usize) -> Vec<(String, bool)> {
+        let mut paths = Vec::new();
+        // Keep only one lazy directory iterator per depth, not one allocated
+        // PathBuf per child. A small cap bounds work even in enormous directories.
+        let mut stack: Vec<fs::ReadDir> = Vec::new();
+        let mut next = Some((path.to_path_buf(), include_self));
+        while let Some((path, include)) = next.take() {
+            if self.stop.load(Ordering::Acquire) || paths.len() >= budget { break; }
+            if self.allowed(&path) {
+                if let Ok(meta) = fs::symlink_metadata(&path) {
+                    let is_dir = if meta.is_symlink() { path.is_dir() } else { meta.is_dir() };
+                    if include { paths.push((path.to_string_lossy().into_owned(), is_dir)); }
+                    if is_dir && !meta.is_symlink() {
+                        // Watch before enumeration so concurrent changes remain queued.
+                        self.add_watch(&path);
+                        if let Ok(entries) = fs::read_dir(&path) { stack.push(entries); }
+                    }
+                }
+            }
+            while let Some(entries) = stack.last_mut() {
+                match entries.next() {
+                    Some(Ok(entry)) => { next = Some((entry.path(), true)); break; }
+                    Some(Err(_)) => {}
+                    None => { stack.pop(); }
+                }
+                if self.stop.load(Ordering::Acquire) { break; }
             }
         }
-        if !inserts.is_empty() || !removes.is_empty() {
-            index.lock().unwrap().apply_batch(inserts, removes);
+        paths
+    }
+
+    fn rebuild(&mut self) -> io::Result<FsIndex> {
+        self.inotify = Inotify::init()?;
+        self.watches.clear();
+        let mut fresh = FsIndex::empty();
+        for root in self.roots.clone() {
+            // A parent watch notices deletion/recreation or movement of the root.
+            if let Some(parent) = root.parent() { self.add_watch(parent); }
+            let entries = self.scan(&root, false, self.cap.saturating_sub(fresh.paths.len()));
+            fresh.apply_batch(entries, vec![]);
         }
+        Ok(fresh)
+    }
+
+    fn reconcile_batch(&mut self, index: &Mutex<FsIndex>, changes: Vec<(PathBuf, bool)>) {
+        let mut files = std::collections::BTreeSet::new();
+        for (path, directory) in changes {
+            if self.stop.load(Ordering::Acquire) { return; }
+            if !self.allowed(&path) { continue; }
+            if directory {
+                self.reconcile(index, &path);
+            } else {
+                files.insert(path);
+            }
+        }
+        let mut insert = Vec::new();
+        let mut remove = Vec::new();
+        for path in files {
+            let text = path.to_string_lossy().into_owned();
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => insert.push((text, if meta.is_symlink() { path.is_dir() } else { meta.is_dir() })),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => remove.push(text),
+                Err(e) => log(&format!("cannot reconcile {}: {e}", path.display())),
+            }
+        }
+        if !insert.is_empty() || !remove.is_empty() {
+            // One merge for the entire kernel batch. Metadata reflects the final
+            // filesystem state, so delete/recreate and recreate/delete both work.
+            let mut idx = index.lock();
+            idx.apply_batch(insert, remove);
+            idx.paths.truncate(self.cap);
+            idx.usage.truncate(self.cap);
+            idx.usage_version = u64::MAX;
+        }
+    }
+
+    fn reconcile(&mut self, index: &Mutex<FsIndex>, path: &Path) {
+        if !self.allowed(path) { return; }
+        let obsolete: Vec<_> = self.watches.iter()
+            .filter(|(_, p)| p.starts_with(path)).map(|(wd, _)| wd.clone()).collect();
+        for wd in obsolete {
+            self.watches.remove(&wd);
+            let _ = self.inotify.watches().remove(wd);
+        }
+        let budget = {
+            let mut idx = index.lock();
+            idx.apply_batch(vec![], vec![path.to_string_lossy().into_owned()]);
+            self.cap.saturating_sub(idx.paths.len())
+        };
+        let include = !self.roots.iter().any(|root| root == path);
+        let entries = self.scan(path, include, budget);
+        let mut idx = index.lock();
+        idx.apply_batch(entries, vec![]);
+        // New entries must receive current model usage on the next prediction.
+        idx.usage_version = u64::MAX;
     }
 }
 
@@ -559,6 +569,139 @@ mod tests {
         paths.sort();
         let n = paths.len();
         FsIndex { paths, usage: vec![0.0; n], usage_version: 0 }
+    }
+
+    struct TempRoot(PathBuf);
+    impl TempRoot {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!("foresight-watch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn config(&self, cap: usize) -> Config {
+            let mut config = Config::default();
+            config.scan.roots = vec![self.0.to_string_lossy().into_owned()];
+            config.scan.max_entries_normal = cap;
+            config
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+
+    fn eventually(index: &Mutex<FsIndex>, predicate: impl Fn(&FsIndex) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if predicate(&index.lock()) { return; }
+            assert!(std::time::Instant::now() < deadline, "watcher did not converge: {:?}", index.lock().paths);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn inotify_tracks_descendants_after_populated_subtree_rename() {
+        let root = TempRoot::new();
+        let old = root.0.join("old");
+        let new = root.0.join("new");
+        fs::create_dir_all(old.join("sub")).unwrap();
+        fs::write(old.join("sub/child"), b"").unwrap();
+        let index = Arc::new(Mutex::new(FsIndex::empty()));
+        let watcher = Watcher::start(index.clone(), root.config(100), "").unwrap();
+        fs::rename(&old, &new).unwrap();
+        eventually(&index, |idx| idx.contains(new.join("sub/child").to_str().unwrap())
+            && !idx.contains(old.join("sub/child").to_str().unwrap()));
+        // This event originates on a descendant watch. Stale descriptors would
+        // publish it under old/sub instead of the moved directory.
+        fs::write(new.join("sub/later"), b"").unwrap();
+        eventually(&index, |idx| idx.contains(new.join("sub/later").to_str().unwrap()));
+        fs::remove_file(new.join("sub/child")).unwrap();
+        fs::write(new.join("sub/child"), b"recreated").unwrap();
+        fs::remove_file(new.join("sub/later")).unwrap();
+        fs::write(new.join("sub/marker"), b"").unwrap();
+        eventually(&index, |idx| idx.contains(new.join("sub/marker").to_str().unwrap())
+            && idx.contains(new.join("sub/child").to_str().unwrap())
+            && !idx.contains(new.join("sub/later").to_str().unwrap()));
+        drop(watcher);
+        assert!(!index.lock().paths.iter().any(|(p, _)| Path::new(p).starts_with(&old)));
+    }
+
+    #[test]
+    fn inotify_file_bursts_respect_cap_and_reconfigured_exclusions() {
+        let root = TempRoot::new();
+        let index = Arc::new(Mutex::new(FsIndex::empty()));
+        let watcher = Watcher::start(index.clone(), root.config(10), "").unwrap();
+        for n in 0..128 { fs::write(root.0.join(format!("file-{n:03}")), b"").unwrap(); }
+        eventually(&index, |idx| idx.paths.len() == 10);
+        drop(watcher);
+        assert_eq!(index.lock().paths.len(), 10);
+        let mut config = root.config(10);
+        config.scan.exclude_names.push("blocked".into());
+        for n in 0..128 { fs::remove_file(root.0.join(format!("file-{n:03}"))).unwrap(); }
+        let watcher = Watcher::start(index.clone(), config, "").unwrap();
+        fs::create_dir(root.0.join("blocked")).unwrap();
+        fs::write(root.0.join("blocked/hidden"), b"").unwrap();
+        fs::write(root.0.join("allowed"), b"").unwrap();
+        eventually(&index, |idx| idx.contains(root.0.join("allowed").to_str().unwrap()));
+        drop(watcher);
+        assert_eq!(index.lock().paths, vec![(root.0.join("allowed").to_string_lossy().into_owned(), false)]);
+    }
+    #[test]
+    fn ordered_delete_recreate_and_subtree_move_reconcile_final_state() {
+        let root = TempRoot::new();
+        let old = root.0.join("old");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("child"), b"").unwrap();
+        let mut live = LiveIndex::new(root.config(100), "", Arc::new(AtomicBool::new(false))).unwrap();
+        let index = Mutex::new(live.rebuild().unwrap());
+        fs::remove_file(old.join("child")).unwrap();
+        fs::write(old.join("child"), b"recreated").unwrap();
+        live.reconcile_batch(&index, vec![(old.join("child"), false), (old.join("child"), false)]);
+        assert!(index.lock().contains(old.join("child").to_str().unwrap()));
+        let new = root.0.join("new");
+        fs::rename(&old, &new).unwrap();
+        live.reconcile(&index, &old);
+        live.reconcile(&index, &new);
+        assert!(!index.lock().contains(old.join("child").to_str().unwrap()));
+        assert!(index.lock().contains(new.join("child").to_str().unwrap()));
+        fs::write(new.join("later"), b"").unwrap();
+        live.reconcile_batch(&index, vec![(new.join("later"), false)]);
+        assert!(index.lock().contains(new.join("later").to_str().unwrap()));
+    }
+
+    #[test]
+    fn live_cap_exclusions_and_resynchronization() {
+        let root = TempRoot::new();
+        let mut config = root.config(2);
+        config.scan.exclude_names.push("skip".into());
+        let mut live = LiveIndex::new(config, "", Arc::new(AtomicBool::new(false))).unwrap();
+        let index = Mutex::new(live.rebuild().unwrap());
+        for name in ["a", "b", "c", "skip"] {
+            let path = root.0.join(name);
+            fs::write(&path, b"").unwrap();
+            live.reconcile_batch(&index, vec![(path, false)]);
+        }
+        assert_eq!(index.lock().paths.len(), 2);
+        assert!(!index.lock().contains(root.0.join("skip").to_str().unwrap()));
+        fs::remove_file(root.0.join("a")).unwrap();
+        fs::remove_file(root.0.join("b")).unwrap();
+        *index.lock() = live.rebuild().unwrap();
+        assert_eq!(index.lock().paths, vec![(root.0.join("c").to_string_lossy().into_owned(), false)]);
+    }
+
+    #[test]
+    fn stopped_watcher_cannot_modify_reconfigured_index() {
+        let old = TempRoot::new();
+        let new = TempRoot::new();
+        let index = Arc::new(Mutex::new(FsIndex::empty()));
+        let watcher = Watcher::start(index.clone(), old.config(10), "").unwrap();
+        drop(watcher);
+        fs::write(old.0.join("obsolete"), b"").unwrap();
+        fs::write(new.0.join("current"), b"").unwrap();
+        let watcher = Watcher::start(index.clone(), new.config(10), "").unwrap();
+        drop(watcher);
+        assert_eq!(index.lock().paths, vec![(new.0.join("current").to_string_lossy().into_owned(), false)]);
     }
 
     #[test]

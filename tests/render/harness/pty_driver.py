@@ -72,6 +72,8 @@ class PtyProcess:
         if pid == 0:
             os.environ.clear()
             os.environ.update(env or {})
+            if os.environ.get("HOME"):
+                os.chdir(os.environ["HOME"])
             try:
                 os.execvp(argv[0], argv)
             except Exception:

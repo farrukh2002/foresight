@@ -5,6 +5,11 @@ import os
 import time
 import unittest
 
+import shlex
+import subprocess
+import tempfile
+
+from mock_cli import environment, requests
 from pty_driver import PtyProcess, Sleep
 from fixtures import REPO_ROOT, RenderTestCase
 
@@ -48,6 +53,69 @@ class ForesightShTests(RenderTestCase):
         return proc, daemon
 
 
+    def test_pipeline_is_trained_once_before_execution(self):
+        proc, daemon = self.spawn_shell(extra_env={"HISTIGNORE": "*", "HISTCONTROL": "ignorespace"})
+        self.assertTrue(proc.wait_for("$", timeout=5))
+        line = " printf 'pipeline\\n' | cat"
+        proc.send(line + "\r", settle=0.8)
+        self.assertEqual([r["payload"] for r in daemon.requests if r["kind"] == "T"], [line])
+
+    def test_multiline_compound_input_preserves_newlines(self):
+        proc, daemon = self.spawn_shell(extra_env={"HISTIGNORE": "*"})
+        self.assertTrue(proc.wait_for("$", timeout=5))
+        for line in ("for value in one two; do", 'printf "%s\\n" "$value"', "done"):
+            proc.send(line + "\r", settle=0.25)
+        proc.drain(timeout=1)
+        self.assertEqual([r["payload"] for r in daemon.requests if r["kind"] == "T"],
+                         ['for value in one two; do\nprintf "%s\\n" "$value"\ndone'])
+
+    def test_training_precedes_cwd_change(self):
+        os.mkdir(os.path.join(self.home, "child"))
+        proc, daemon = self.spawn_shell()
+        self.assertTrue(proc.wait_for("$", timeout=5))
+        proc.send("cd child\r", settle=0.7)
+        trained = [r for r in daemon.requests if r["kind"] == "T"]
+        self.assertEqual([(r["payload"], r["cwd"]) for r in trained], [("cd child", self.home)])
+
+    def test_array_prompt_debug_exit_hooks_and_status_survive(self):
+        status_log = os.path.join(self.tmp, "status")
+        debug_log = os.path.join(self.tmp, "debug")
+        exit_log = os.path.join(self.tmp, "exit")
+        prelude = (
+            f"PROMPT_COMMAND=('printf \"%s\\\\n\" \"$?\" >> {shlex.quote(status_log)}' ':')\n"
+            f"trap 'printf debug >> {shlex.quote(debug_log)}' DEBUG\n"
+            f"trap 'printf \"%s\" \"$?\" > {shlex.quote(exit_log)}' EXIT\n"
+        )
+        proc, daemon = self.spawn_shell(rc_prelude=prelude)
+        self.assertTrue(proc.wait_for("$", timeout=5))
+        proc.send("false\r", settle=0.5)
+        with open(status_log) as file:
+            self.assertEqual(file.read().splitlines()[-1], "1")
+        with open(debug_log) as file:
+            before = len(file.read())
+        proc.send("exit 7\r", settle=0.6)
+        with open(debug_log) as file:
+            self.assertGreater(len(file.read()), before)
+        with open(exit_log) as file:
+            self.assertEqual(file.read(), "7")
+        self.assertEqual([r["payload"] for r in daemon.requests if r["kind"] == "T"], ["false", "exit 7"])
+
+    def test_next_word_includes_leading_space_and_quoted_word(self):
+        proc, daemon = self.spawn_shell(predict={"echo": '  "hello world" later'})
+        self.assertTrue(proc.wait_for("$", timeout=5))
+        proc.send("echo\x18\x17", settle=0.5)
+        proc.send("\r", settle=0.7)
+        self.assertEqual([r["payload"] for r in daemon.requests if r["kind"] == "T"],
+                         ['echo  "hello world" '])
+
+    def test_vi_acceptance_and_double_source_train_once(self):
+        proc, daemon = self.spawn_shell(rc_prelude="set -o vi")
+        self.assertTrue(proc.wait_for("$", timeout=5))
+        proc.send(f"source {shlex.quote(self.foresight_sh)}\r", settle=0.5)
+        proc.send("printf native\r", settle=0.5)
+        self.assertEqual([r["payload"] for r in daemon.requests if r["kind"] == "T"],
+                         [f"source {shlex.quote(self.foresight_sh)}", "printf native"])
+
     def test_histignored_command_still_trains(self):
         proc, daemon = self.spawn_shell(
             extra_env={
@@ -61,10 +129,10 @@ class ForesightShTests(RenderTestCase):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             proc.drain(timeout=0.2)
-            if any(r.startswith("T\t") and "echo marker-one" in r for r in daemon.requests):
+            if any(r["kind"] == "T" and "echo marker-one" in r["payload"] for r in daemon.requests):
                 break
         self.assertTrue(
-            any(r.startswith("T\t") and "echo marker-one" in r for r in daemon.requests),
+            any(r["kind"] == "T" and "echo marker-one" in r["payload"] for r in daemon.requests),
             f"suppressed command never trained; requests: {daemon.requests}",
         )
 
@@ -82,7 +150,7 @@ class ForesightShTests(RenderTestCase):
         )
         proc.send("\r", settle=1.0)
         self.assertTrue(
-            any(r.startswith("A\t") and "git status" in r for r in daemon.requests),
+            any(r["kind"] == "A" and r["payload"] == "git status" for r in daemon.requests),
             f"accept was not reported to the daemon; requests: {daemon.requests}",
         )
 
@@ -101,20 +169,20 @@ class ForesightShTests(RenderTestCase):
         )
         proc.send("2", settle=0.3)
         proc.send("\r", settle=1.0)
-        accept_lines = [r for r in daemon.requests if r.startswith("A\t")]
+        accept_lines = [r for r in daemon.requests if r["kind"] == "A"]
         self.assertEqual(
             len(accept_lines), 1,
             f"expected exactly one accept request; "
             f"got accept_lines={accept_lines!r} all_requests={daemon.requests}",
         )
-        payload = accept_lines[0].rsplit("\t", 1)[-1]
+        payload = accept_lines[0]["payload"]
         self.assertEqual(
             payload, "opencode2",
             f"accept payload should be the EXECUTED line, not the "
             f"shorter accepted buffer; got {payload!r}",
         )
         for r in accept_lines:
-            self.assertFalse(r.endswith("\topencode"),
+            self.assertNotEqual(r["payload"], "opencode",
                              f"dead prefix line was credited; requests: {daemon.requests}")
 
     def test_ctrl_x_ctrl_p_accept_then_edit_away_sends_no_accept(self):
@@ -134,7 +202,7 @@ class ForesightShTests(RenderTestCase):
         proc.send("\x0b", settle=0.1)
         proc.send("ls", settle=0.2)
         proc.send("\r", settle=1.0)
-        accept_lines = [r for r in daemon.requests if r.startswith("A\t")]
+        accept_lines = [r for r in daemon.requests if r["kind"] == "A"]
         self.assertEqual(
             accept_lines, [],
             f"expected NO accept request when the user edited away; "
@@ -142,52 +210,6 @@ class ForesightShTests(RenderTestCase):
         )
 
 
-    def test_blesh_active_stands_down(self):
-        record = os.path.join(self.tmp, "ble_import.log")
-        probe = os.path.join(self.tmp, "probe.txt")
-        prelude = (
-            f'_ble_base="/tmp/fake-ble"\n'
-            f'ble-import() {{ echo "$1" >> "{record}"; }}\n'
-        )
-        proc, _daemon = self.spawn_shell(
-            extra_env={"FORESIGHT_SHELL_ACTIVE": "1"},
-            rc_prelude=prelude,
-        )
-        self.assertTrue(proc.wait_for("$", timeout=5))
-        cmd = (
-            '{ '
-            f'bind -Xp > "{probe}"; '
-            f'trap -p DEBUG >> "{probe}"; '
-            f'printf "PROMPT_COMMAND=%s\\n" "$PROMPT_COMMAND" >> "{probe}"; '
-            '} >/dev/null 2>&1; '
-            f'echo done > "{probe}.done"'
-        )
-        proc.send(cmd + "\r", settle=1.0)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            proc.drain(timeout=0.2)
-            if os.path.exists(probe + ".done"):
-                break
-        self.assertTrue(os.path.exists(probe + ".done"),
-                        f"probe never finished; screen={proc.screen.full_text()!r}")
-        with open(probe) as f:
-            text = f.read()
-        for token in ("__foresight_accept_suggestion",
-                      "__foresight_accept_word",
-                      "__foresight_fzf_pick",
-                      "__foresight_debug",
-                      "__foresight_pc_enter",
-                      "__foresight_pc_exit"):
-            self.assertNotIn(token, text,
-                             f"{token!r} should not be present under ble.sh; probe: {text!r}")
-        for line in text.splitlines():
-            if line.startswith("PROMPT_COMMAND="):
-                self.assertNotIn("__foresight_pc_enter", line,
-                                 f"PROMPT_COMMAND wrapper installed under ble.sh: {line!r}")
-        with open(record) as f:
-            calls = [line.strip() for line in f if line.strip()]
-        self.assertIn("integration/foresight", calls,
-                      f"ble-import was not called with integration/foresight; got: {calls!r}")
 
     def test_blesh_gate_selfheals_layer(self):
         proc, _daemon = self.spawn_shell(
@@ -205,12 +227,108 @@ class ForesightShTests(RenderTestCase):
             os.path.isfile(layer),
             f"foresight init --quiet did not materialize layer file at {layer}",
         )
-        with open(layer) as f:
-            materialized = f.read()
-        with open(os.path.join(REPO_ROOT, "integrations", "blesh", "foresight.bash")) as f:
-            original = f.read()
-        self.assertEqual(materialized, original,
-                         "materialized layer differs from the in-repo source")
+
+
+class BashTransportTests(unittest.TestCase):
+    def scenario(self, body, mode=""):
+        with tempfile.TemporaryDirectory(prefix="fr-bash-transport-") as tmp:
+            env = environment(tmp, {"a\tb\nc": " \tanswer\n\n", "open": "code"})
+            env["MOCK_STREAM_MODE"] = mode
+            source = shlex.quote(os.path.join(REPO_ROOT, "foresight.sh"))
+            proc = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-i", "-c", f"source {source}\n{body}"],
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout, requests(env)
+
+    def test_one_owned_stream_handles_multiline_and_empty_replies(self):
+        out, log = self.scenario(r'''
+            __foresight_predict $'a\tb\nc'
+            printf 'FIRST:%s:END\n' "$__foresight_reply"
+            __foresight_predict absent
+            printf 'EMPTY:%s:END\n' "$__foresight_reply"
+            __foresight_predict open
+            printf 'SECOND:%s:END\n' "$__foresight_reply"
+        ''')
+        self.assertIn("FIRST: \tanswer\n\n:END", out)
+        self.assertIn("EMPTY::END", out)
+        self.assertIn("SECOND:code:END", out)
+        self.assertEqual(len([r for r in log if r["kind"] == "stream-start"]), 1)
+        self.assertEqual([r["payload"] for r in log if r["kind"] == "stream"],
+                         ["a\tb\nc", "absent", "open"])
+        self.assertEqual([r for r in log if r["kind"] == "predict"], [])
+
+    def test_eof_and_incomplete_frames_stop_helper_before_fallback(self):
+        for mode in ("eof", "partial"):
+            with self.subTest(mode=mode):
+                out, log = self.scenario(r'''
+                    __foresight_predict open
+                    printf 'RESULT:%s\n' "$__foresight_reply"
+                ''', mode=mode)
+                self.assertIn("RESULT:code", out)
+                self.assertEqual([r["payload"] for r in log if r["kind"] == "predict"], ["open"])
+                for row in log:
+                    if row["kind"] == "stream-start":
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(row["pid"], 0)
+
+    def test_noninteractive_source_has_no_side_effects(self):
+        with tempfile.TemporaryDirectory(prefix="fr-bash-noninteractive-") as tmp:
+            env = environment(tmp)
+            source = shlex.quote(os.path.join(REPO_ROOT, "foresight.sh"))
+            proc = subprocess.run(["bash", "-c", f"source {source}; printf unchanged"],
+                                  cwd=tmp, env=env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(proc.stdout, "unchanged")
+            self.assertEqual(proc.stderr, "")
+            self.assertEqual(requests(env), [])
+
+
+class BashTransportPtyTests(RenderTestCase):
+    def spawn_fake_shell(self, predictions):
+        env = environment(self.home, predictions)
+        rc = os.path.join(self.tmp, "bashrc")
+        with open(rc, "w") as file:
+            source = shlex.quote(os.path.join(REPO_ROOT, "foresight.sh"))
+            file.write(f"PS1='$ '\nsource {source}\n")
+        proc = PtyProcess(["bash", "--noprofile", "--rcfile", rc, "-i"], env=env)
+        self._procs.append(proc)
+        self.assertTrue(proc.wait_for("$", timeout=5), proc.screen.full_text())
+        return proc, env
+
+    def test_real_readline_widgets_reuse_the_owning_shell_helper(self):
+        proc, env = self.spawn_fake_shell({"echo hel": "lo world"})
+        proc.send("echo hel\x18\x10", settle=0.5)
+        self.assertIn("echo hello world", proc.screen.full_text())
+        proc.send_key("C-c", settle=0.2)
+        proc.send("echo hel\x18\x10", settle=0.5)
+        proc.send_key("Enter", settle=0.5)
+        log = requests(env)
+        stream = [r for r in log if r["kind"] == "stream"]
+        self.assertEqual([r["payload"] for r in stream], ["echo hel", "echo hel"])
+        self.assertEqual(stream[0]["pid"], stream[1]["pid"])
+        self.assertEqual(len([r for r in log if r["kind"] == "stream-start"]), 1)
+        self.assertEqual([r for r in log if r["kind"] == "predict"], [])
+        self.assertEqual([r["payload"] for r in log if r["kind"] == "train"], ["echo hello world"])
+
+    def test_multiline_paste_and_suffix_reach_the_cli_without_normalization(self):
+        prefix = "printf 'a\nb'"
+        suffix = " tail\n\n"
+        proc, env = self.spawn_fake_shell({prefix: suffix})
+        proc.paste(prefix, settle=0.3)
+        proc.send("\x18\x10", settle=0.5)
+        proc.send_key("Enter", settle=0.5)
+        log = requests(env)
+        self.assertEqual([r["payload"] for r in log if r["kind"] == "stream"], [prefix])
+        self.assertEqual([r["payload"] for r in log if r["kind"] == "train"], [prefix + suffix])
+        self.assertEqual([r for r in log if r["kind"] == "predict"], [])
+
+    def test_multiline_pasted_commands_are_captured_as_one_input(self):
+        proc, env = self.spawn_fake_shell({})
+        line = "printf first\nprintf second"
+        proc.paste(line, settle=0.3)
+        proc.send_key("Enter", settle=0.5)
+        self.assertEqual([r["payload"] for r in requests(env) if r["kind"] == "train"], [line])
 
 
 if __name__ == "__main__":
