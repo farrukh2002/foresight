@@ -199,12 +199,14 @@ impl Model {
             return ('\0', String::new());
         }
         let text = self.lines[idx].text.clone();
+        let old_count = self.lines[idx].count;
+        let old_weight = self.lines[idx].weight;
         self.add_line_votes(&text, -1);
-        self.lines[idx].count = self.lines[idx].count.saturating_sub(1);
-        self.lines[idx].weight = (self.lines[idx].weight - 1.0).max(0.0);
+        self.lines[idx].count = old_count.saturating_sub(1);
+        self.lines[idx].weight = (old_weight - 1.0).max(0.0);
         let result = self.predict_with(partial, cwd, now, true, prev_shape);
-        self.lines[idx].count += 1;
-        self.lines[idx].weight += 1.0;
+        self.lines[idx].count = old_count;
+        self.lines[idx].weight = old_weight;
         self.add_line_votes(&text, 1);
         result
     }
@@ -369,6 +371,9 @@ impl Model {
         let prev = prev_shape?;
         let mut out = HashSet::new();
         for entry in &self.lines {
+            if entry.count == 0 {
+                continue;
+            }
             if self.seq_strength(prev, entry.shape, now) > 0.0 {
                 out.extend(entry.text.split_whitespace().filter_map(|w| self.vocab.get(w)));
             }
@@ -403,6 +408,9 @@ impl Model {
             }
             let ctx = bi.map_or(0, |m| m.get(&id).copied().unwrap_or(0));
             let score = ctx as f64 * CONTEXT_WEIGHT + self.word_freq.get(id as usize).copied().unwrap_or(0) as f64;
+            if score <= 0.0 {
+                continue;
+            }
             let better = match best {
                 None => true,
                 Some((bs, _)) => score > bs,
@@ -509,6 +517,9 @@ impl Model {
                     }
                     let ctx = bi.map_or(0, |m| m.get(&id).copied().unwrap_or(0));
                     let score = ctx as f64 * CONTEXT_WEIGHT + self.word_freq.get(id as usize).copied().unwrap_or(0) as f64;
+                    if score <= 0.0 {
+                        return None;
+                    }
                     Some((score, word))
                 })
                 .collect();
@@ -1033,6 +1044,30 @@ mod tests {
         assert!(m.shape_bigram.contains_key(&(shape1, shape2)), "adjacent transition across timestamp must be recorded");
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn holdout_suppresses_zero_vote_vocab_and_restores_state() {
+        let mut m = Model::default();
+        m.train("run uniquesecret", "/home/u", "/home/u", 1000);
+        let now = 2000;
+
+        let initial_count = m.lines[0].count;
+        let initial_weight = m.lines[0].weight;
+
+        // Holding out the only occurrence of uniquesecret must NOT predict "ecret"
+        let (tag, comp) = m.holdout_predict(0, "run uniques", "", now, None);
+        assert_ne!(comp, "ecret", "must never suggest ecret from zero votes");
+        assert_eq!(tag, '\0');
+
+        // State must be completely restored
+        assert_eq!(m.lines[0].count, initial_count);
+        assert_eq!(m.lines[0].weight, initial_weight);
+
+        // After holdout finishes, normal prediction can suggest it
+        let (tag2, comp2) = m.predict_with("run uniques", "", now, true, None);
+        assert_eq!(tag2, 'W');
+        assert_eq!(comp2, "ecret");
     }
 
     #[test]
