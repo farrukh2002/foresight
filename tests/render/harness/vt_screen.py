@@ -250,11 +250,23 @@ class VTScreen:
                 self.grid[r] = [Cell() for _ in range(self.cols)]
 
     def _put_char(self, ch: str) -> None:
+        w = self._char_width(ch)
+        if w == 0:
+            # A combining mark belongs to the preceding glyph, not the next
+            # cursor cell. Delayed autowrap must remain delayed.
+            row = self.cur_row
+            col = self.cur_col if self.pending_wrap else self.cur_col - 1
+            if col < 0:
+                row, col = row - 1, self.cols - 1
+            if row >= 0:
+                while col > 0 and self.grid[row][col].ch == "":
+                    col -= 1
+                self.grid[row][col].ch += ch
+            return
         if self.pending_wrap:
             self.cur_col = 0
             self._newline()
             self.pending_wrap = False
-        w = self._char_width(ch)
         self.grid[self.cur_row][self.cur_col] = Cell(ch, self._attrs)
         if w == 2 and self.cur_col + 1 < self.cols:
             self.grid[self.cur_row][self.cur_col + 1] = Cell("", self._attrs)
@@ -284,7 +296,7 @@ class VTScreen:
         cp = ord(ch)
         if cp < 32 or ch == "\x7f":
             return 0
-        if 0x0300 <= cp <= 0x036F:
+        if unicodedata.category(ch) in ("Mn", "Me"):
             return 0
         if cp in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF):
             return 0
