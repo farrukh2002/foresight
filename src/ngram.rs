@@ -529,12 +529,32 @@ impl Model {
             out.push(('L', c));
         }
         if out.is_empty() {
+            let ends_with_space = partial.ends_with(' ');
             let tokens: Vec<&str> = partial.split_whitespace().collect();
-            let ctx_ids: Vec<u32> = tokens.iter().filter_map(|w| self.vocab.get(w)).collect();
-            if let Some((tag, id, _prob, _margin)) = self.backoff_next_word(&ctx_ids, None) {
-                out.push((tag, self.vocab.text(id).to_string()));
-            }
-            if !partial.ends_with(' ') && !tokens.is_empty() {
+
+            if ends_with_space || tokens.is_empty() {
+                let ctx_ids = self.contiguous_context_ids(&tokens, 2);
+                let boost = self.seq_boost_words(prev_shape, now);
+                if let Some((tag, word_id, prob, margin)) = self.backoff_next_word(&ctx_ids, boost.as_ref()) {
+                    let gate_ok = match tag {
+                        'T' => prob >= T_MIN_P,
+                        'B' => prob >= B_MIN_P && margin >= B_MIN_MARGIN,
+                        _ => true,
+                    };
+                    if gate_ok {
+                        let first = self.vocab.text(word_id).to_string();
+                        if tag == 'T' {
+                            if let Some(chain) = self.chain_next_words(&ctx_ids, word_id, CHAIN_MAX_WORDS, boost.as_ref()) {
+                                out.push((tag, chain));
+                            } else {
+                                out.push((tag, first));
+                            }
+                        } else {
+                            out.push((tag, first));
+                        }
+                    }
+                }
+            } else {
                 let last_word = last_shell_word(partial);
                 if is_path_shaped(&last_word) {
                     if let Some(rest) = self.fs_complete_path(&last_word, cwd, now) {
@@ -544,7 +564,14 @@ impl Model {
                     }
                 }
                 if out.is_empty() {
-                    let prev_id = if tokens.len() >= 2 { self.vocab.get(tokens[tokens.len() - 2]) } else { None };
+                    let prefix = tokens[tokens.len() - 1];
+                    let prev_id = if tokens.len() >= 2 {
+                        self.vocab.get(tokens[tokens.len() - 2]).filter(|&id| {
+                            self.word_freq.get(id as usize).copied().unwrap_or(0) > 0
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(w) = self.best_word_prefix(prefix, prev_id) {
                         out.push(('W', w[prefix.len()..].to_string()));
                     }
@@ -936,6 +963,30 @@ mod tests {
         assert_ne!(next_unk, "status");
         assert_ne!(next_unk, "ready");
         assert_eq!(tag_unk, '\0');
+    }
+
+    #[test]
+    fn topk_respects_spacing_and_never_appends_bare_word_without_space() {
+        let mut m = Model::default();
+        for _ in 0..5 {
+            m.train("git status ready", "/home/u", "/home/u", 1000);
+        }
+        let now = 2000;
+
+        // When partial is "status" without trailing space and without matching line prefix:
+        // topk must NOT return "ready" without space!
+        let results = m.topk("status", "", now, 5, None);
+        for (_tag, cont) in &results {
+            assert_ne!(cont, "ready", "must never append bare ready into statusready");
+            let full = format!("status{cont}");
+            assert!(!full.starts_with("statusready"));
+        }
+
+        // When partial is "status " WITH trailing space:
+        // topk can suggest "ready" because "status " + "ready" = "status ready"
+        let results_sp = m.topk("status ", "", now, 5, None);
+        let has_ready = results_sp.iter().any(|(_, s)| s.starts_with("ready"));
+        assert!(has_ready, "should suggest ready when space is present");
     }
 
     #[test]
