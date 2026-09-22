@@ -73,7 +73,6 @@ impl Model {
             self.word_freq.push(0);
         }
         self.word_freq[id as usize] += 1;
-        self.total_words += 1;
         id
     }
 
@@ -877,6 +876,21 @@ mod tests {
         assert!(suffix.starts_with("b.txt"), "trained path should outrank aaa, got {suffix}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn train_counts_each_word_exactly_once() {
+        let mut m = Model::default();
+        m.train("echo hello", "/home/u", "/home/u", 1000);
+        assert_eq!(m.total_words, 2);
+        let sum_freq: u64 = m.word_freq.iter().map(|&c| c as u64).sum();
+        assert_eq!(sum_freq, 2);
+
+        let tmp = std::env::temp_dir().join(format!("test_word_count_{}.bin", std::process::id()));
+        m.save(&tmp).unwrap();
+        let loaded = Model::load(&tmp).unwrap();
+        assert_eq!(loaded.total_words, 2);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
