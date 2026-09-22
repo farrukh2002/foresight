@@ -36,6 +36,32 @@ jobs:
           esac
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo build
+        run: cargo build --verbose --locked --all-features
+      - name: cargo test
+        run: cargo test --verbose --locked --all-features
+      - name: Install zsh for integration tests
+        run: |
+          if ! command -v zsh >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+          fi
+      - name: Install test shell plugins (ble.sh, zsh-autosuggestions)
+        run: |
+          mkdir -p /tmp/fixtures
+          curl -fsSL "https://github.com/akinomyoga/ble.sh/releases/download/nightly/ble-nightly-20260908%2Bd81fd54.tar.xz" | tar -xJf - -C /tmp/fixtures
+          curl -fsSL "https://raw.githubusercontent.com/zsh-users/zsh-autosuggestions/v0.7.1/zsh-autosuggestions.zsh" -o /tmp/fixtures/zsh-autosuggestions.zsh
+          echo "BLE_SH=/tmp/fixtures/ble-nightly-20260908+d81fd54/ble.sh" >> "$GITHUB_ENV"
+          echo "ZSH_AUTOSUGGESTIONS_FILE=/tmp/fixtures/zsh-autosuggestions.zsh" >> "$GITHUB_ENV"
+      - name: render harness (pty + unit)
+        run: python3 tests/render/run_tests.py
+      - name: installer tests
+        run: bash tests/installer_test.sh
+
   build:
     needs: check-version
     strategy:
@@ -66,7 +92,7 @@ jobs:
           path: ${{ matrix.asset }}
 
   release:
-    needs: [check-version, build]
+    needs: [check-version, build, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
