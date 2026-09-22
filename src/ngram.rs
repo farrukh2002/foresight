@@ -226,7 +226,8 @@ impl Model {
             return ('L', cont);
         }
 
-        let ends_with_space = partial.ends_with(' ');
+        let last_word = last_shell_word(partial);
+        let ends_with_space = partial.ends_with(char::is_whitespace) && last_word.is_empty();
         let tokens: Vec<&str> = partial.split_whitespace().collect();
 
         if ends_with_space || tokens.is_empty() {
@@ -252,7 +253,6 @@ impl Model {
         }
 
         let prefix = tokens[tokens.len() - 1];
-        let last_word = last_shell_word(partial);
         if is_path_shaped(&last_word) {
             if let Some(rest) = self.fs_complete_path(&last_word, cwd, now) {
                 if let Some(escaped) = escape_path_suffix(partial, &rest) {
@@ -546,7 +546,8 @@ impl Model {
             out.push(('L', c));
         }
         if out.is_empty() {
-            let ends_with_space = partial.ends_with(' ');
+            let last_word = last_shell_word(partial);
+            let ends_with_space = partial.ends_with(char::is_whitespace) && last_word.is_empty();
             let tokens: Vec<&str> = partial.split_whitespace().collect();
 
             if ends_with_space || tokens.is_empty() {
@@ -572,7 +573,6 @@ impl Model {
                     }
                 }
             } else {
-                let last_word = last_shell_word(partial);
                 if is_path_shaped(&last_word) {
                     if let Some(rest) = self.fs_complete_path(&last_word, cwd, now) {
                         if let Some(escaped) = escape_path_suffix(partial, &rest) {
@@ -956,6 +956,11 @@ mod tests {
         // Single quoted should finish closing quote
         let (tag, suffix) = m.predict_with(&format!("cat '{d}/hello"), "", now, false, None);
         assert_eq!((tag, suffix.as_str()), ('F', " world.txt'"));
+
+        // A quoted space is part of the path, not an n-gram word boundary.
+        let prefix = format!("cat '{d}/hello ");
+        assert_eq!(m.predict_with(&prefix, "", now, false, None), ('F', "world.txt'".into()));
+        assert_eq!(m.topk(&prefix, "", now, 5, None), vec![('F', "world.txt'".into())]);
 
         let _ = fs::remove_dir_all(&dir);
     }
