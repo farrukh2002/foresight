@@ -35,7 +35,7 @@ detect_asset() {
 ASSET=$(detect_asset)
 
 if [ -z "$VERSION" ]; then
-    VERSION=$(curl -fsSL "https://github.com/$OWNER/$REPO/releases/download/$CHANNEL/VERSION")
+    VERSION=$(curl -fsSL "https://github.com/$OWNER/$REPO/releases/download/$CHANNEL/VERSION" | tr -d '\r\n')
 fi
 
 echo "Installing foresight $VERSION ($ASSET, $CHANNEL channel)..."
@@ -58,19 +58,40 @@ tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
 mkdir -p "$BIN_DIR" "$SHARE_DIR" "$CONFIG_DIR"
 install -m 755 "$TMP_DIR/$BIN_NAME" "$BIN_DIR/$BIN_NAME"
+
+# Capture actual ble.sh presence BEFORE init materializes its integration directory
+HAS_BLESH=false
+BASHRC="$HOME/.bashrc"
+if grep -q 'ble\.sh' "$BASHRC" 2>/dev/null \
+    || [ -f "$HOME/.blerc" ] \
+    || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh" ] \
+    || [ -f "${XDG_DATA_HOME:-$HOME/.local/share}/blesh/ble.sh" ] \
+    || command -v ble.sh >/dev/null 2>&1; then
+    HAS_BLESH=true
+fi
+
 "$BIN_DIR/$BIN_NAME" init --quiet
 
-SOURCE_LINE="source \"$SHARE_DIR/foresight.sh\""
-BASHRC="$HOME/.bashrc"
-if ! grep -qF "$SOURCE_LINE" "$BASHRC" 2>/dev/null; then
+# Canonical rc statements use literal runtime $HOME so any HOME content
+# (spaces, $, quotes, backticks) survives round-trip through the rc file.
+PATH_LINE='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+SOURCE_LINE='source "$HOME/.local/share/foresight/foresight.sh"'
+ZSH_SOURCE_LINE='source "$HOME/.local/share/foresight/foresight.zsh"'
+
+mkdir -p "$(dirname "$BASHRC")"
+if ! grep -qxF "$PATH_LINE" "$BASHRC" 2>/dev/null; then
+    printf '\n%s\n' "$PATH_LINE" >> "$BASHRC"
+    echo "Added PATH entry to $BASHRC"
+fi
+if ! grep -qxF "$SOURCE_LINE" "$BASHRC" 2>/dev/null; then
     printf '\n%s\n' "$SOURCE_LINE" >> "$BASHRC"
     echo "Added source line to $BASHRC"
 fi
 
-BLESH_RC=""
-[ -f "$HOME/.blerc" ] && BLESH_RC="$HOME/.blerc"
-[ -z "$BLESH_RC" ] && BLESH_RC="${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh"
-if grep -q 'ble\.sh' "$HOME/.bashrc" 2>/dev/null || [ -f "$HOME/.blerc" ] || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh" ] || [ -d "${XDG_DATA_HOME:-$HOME/.local/share}/blesh" ]; then
+if [ "$HAS_BLESH" = "true" ]; then
+    BLESH_RC=""
+    [ -f "$HOME/.blerc" ] && BLESH_RC="$HOME/.blerc"
+    [ -z "$BLESH_RC" ] && BLESH_RC="${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh"
     BLESH_LINE="ble-import integration/foresight"
     if ! grep -qF "$BLESH_LINE" "$BLESH_RC" 2>/dev/null; then
         mkdir -p "$(dirname "$BLESH_RC")"
@@ -79,11 +100,16 @@ if grep -q 'ble\.sh' "$HOME/.bashrc" 2>/dev/null || [ -f "$HOME/.blerc" ] || [ -
     fi
 fi
 
-if command -v zsh >/dev/null 2>&1 && [ -f "$HOME/.zshrc" ]; then
-    ZSH_LINE="source \"$SHARE_DIR/foresight.zsh\""
-    if ! grep -qF "$ZSH_LINE" "$HOME/.zshrc" 2>/dev/null; then
-        printf '\n# added by foresight\n%s\n' "$ZSH_LINE" >> "$HOME/.zshrc"
-        echo "zsh: registered in $HOME/.zshrc"
+if command -v zsh >/dev/null 2>&1; then
+    ZSH_RC="${ZDOTDIR:-$HOME}/.zshrc"
+    mkdir -p "$(dirname "$ZSH_RC")"
+    if ! grep -qxF "$PATH_LINE" "$ZSH_RC" 2>/dev/null; then
+        printf '\n%s\n' "$PATH_LINE" >> "$ZSH_RC"
+        echo "zsh: added PATH entry to $ZSH_RC"
+    fi
+    if ! grep -qxF "$ZSH_SOURCE_LINE" "$ZSH_RC" 2>/dev/null; then
+        printf '\n# added by foresight\n%s\n' "$ZSH_SOURCE_LINE" >> "$ZSH_RC"
+        echo "zsh: registered in $ZSH_RC"
     fi
 fi
 
