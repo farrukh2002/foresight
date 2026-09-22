@@ -154,6 +154,25 @@ impl Model {
         self.add_token_votes(&ids, sign);
     }
 
+    fn contiguous_context_ids(&self, tokens: &[&str], max_len: usize) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for &w in tokens.iter().rev() {
+            if let Some(id) = self.vocab.get(w) {
+                if self.word_freq.get(id as usize).copied().unwrap_or(0) == 0 {
+                    break;
+                }
+                ids.push(id);
+                if ids.len() == max_len {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        ids.reverse();
+        ids
+    }
+
     pub fn record_transition(&mut self, prev: u64, cur: u64, now: u64) {
         if prev == 0 || cur == 0 {
             return;
@@ -203,7 +222,7 @@ impl Model {
         let tokens: Vec<&str> = partial.split_whitespace().collect();
 
         if ends_with_space || tokens.is_empty() {
-            let ctx_ids: Vec<u32> = tokens.iter().filter_map(|w| self.vocab.get(w)).collect();
+            let ctx_ids = self.contiguous_context_ids(&tokens, 2);
             let boost = self.seq_boost_words(prev_shape, now);
             if let Some((tag, word_id, prob, margin)) = self.backoff_next_word(&ctx_ids, boost.as_ref()) {
                 let gate_ok = match tag {
@@ -224,6 +243,7 @@ impl Model {
             return ('\0', String::new());
         }
 
+        let prefix = tokens[tokens.len() - 1];
         let last_word = last_shell_word(partial);
         if is_path_shaped(&last_word) {
             if let Some(rest) = self.fs_complete_path(&last_word, cwd, now) {
@@ -236,7 +256,13 @@ impl Model {
         if !allow_word_prefix {
             return ('\0', String::new());
         }
-        let prev_id = if tokens.len() >= 2 { self.vocab.get(tokens[tokens.len() - 2]) } else { None };
+        let prev_id = if tokens.len() >= 2 {
+            self.vocab.get(tokens[tokens.len() - 2]).filter(|&id| {
+                self.word_freq.get(id as usize).copied().unwrap_or(0) > 0
+            })
+        } else {
+            None
+        };
         if let Some(best) = self.best_word_prefix(prefix, prev_id) {
             return ('W', best[prefix.len()..].to_string());
         }
@@ -457,7 +483,7 @@ impl Model {
             parts.push(format!("L: {}", conts.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(" ")));
         }
         let tokens: Vec<&str> = partial.split_whitespace().collect();
-        let ctx_ids: Vec<u32> = tokens.iter().filter_map(|w| self.vocab.get(w)).collect();
+        let ctx_ids = self.contiguous_context_ids(&tokens, 2);
         match self.backoff_next_word(&ctx_ids, None) {
             Some((tag, id, prob, margin)) => {
                 parts.push(format!("{tag}: \"{}\" (p={prob:.2} m={margin:.1})", self.vocab.text(id)))
@@ -891,6 +917,25 @@ mod tests {
         let loaded = Model::load(&tmp).unwrap();
         assert_eq!(loaded.total_words, 2);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn contiguous_ngram_context_does_not_skip_unknown_words() {
+        let mut m = Model::default();
+        m.train("git status ready", "/home/u", "/home/u", 1000);
+        let now = 2000;
+
+        // "git status " has known context [git, status] -> should predict "ready"
+        let (tag, next) = m.predict_with("git status ", "", now, true, None);
+        assert_eq!(tag, 'T');
+        assert_eq!(next, "ready");
+
+        // "git UNKNOWN " has unknown word right before space -> contiguous context is empty!
+        // It must NOT skip UNKNOWN and use "git" as immediate context to suggest "status" or "ready"!
+        let (tag_unk, next_unk) = m.predict_with("git UNKNOWN ", "", now, true, None);
+        assert_ne!(next_unk, "status");
+        assert_ne!(next_unk, "ready");
+        assert_eq!(tag_unk, '\0');
     }
 
     #[test]
