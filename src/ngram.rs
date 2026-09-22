@@ -42,6 +42,11 @@ pub fn recency_weight(last_used: u64, now: u64) -> f64 {
     0.5f64.powf(age_days / HALF_LIFE_DAYS)
 }
 
+fn is_bash_timestamp(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('#') && trimmed.len() > 1 && trimmed[1..].chars().all(|c| c.is_ascii_digit())
+}
+
 pub struct LineEntry {
     pub text: String,
     pub count: u32,
@@ -586,8 +591,12 @@ impl Model {
         let reader = BufReader::new(file);
         let mut prev_shape = 0u64;
         for line in io::BufRead::lines(reader).map_while(Result::ok) {
-            self.train(&line, home, home, now);
-            let shape = line_shape(&line);
+            let trimmed = line.trim();
+            if trimmed.is_empty() || is_bash_timestamp(trimmed) {
+                continue;
+            }
+            self.train(trimmed, home, home, now);
+            let shape = line_shape(trimmed);
             self.record_transition(prev_shape, shape, now);
             prev_shape = shape;
         }
@@ -600,7 +609,11 @@ impl Model {
         let Ok(file) = File::open(path) else { return };
         let mut prev_shape = 0u64;
         for line in io::BufRead::lines(BufReader::new(file)).map_while(Result::ok) {
-            let shape = line_shape(&line);
+            let trimmed = line.trim();
+            if trimmed.is_empty() || is_bash_timestamp(trimmed) {
+                continue;
+            }
+            let shape = line_shape(trimmed);
             self.record_transition(prev_shape, shape, now);
             prev_shape = shape;
         }
@@ -615,8 +628,12 @@ impl Model {
                 (true, Some(i)) => &line[i + 1..],
                 _ => line.as_str(),
             };
-            self.train(cmd, home, home, now);
-            let shape = line_shape(cmd);
+            let trimmed = cmd.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            self.train(trimmed, home, home, now);
+            let shape = line_shape(trimmed);
             self.record_transition(prev_shape, shape, now);
             prev_shape = shape;
         }
@@ -987,6 +1004,35 @@ mod tests {
         let results_sp = m.topk("status ", "", now, 5, None);
         let has_ready = results_sp.iter().any(|(_, s)| s.starts_with("ready"));
         assert!(has_ready, "should suggest ready when space is present");
+    }
+
+    #[test]
+    fn history_import_skips_bash_timestamps_and_records_adjacent_transitions() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("test_hist_{pid}_{nanos}"));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let hist_file = tmp_dir.join(".bash_history");
+        let content = "#1609459200\ngit status\n#1609459205\ngit commit -m \"initial\"\n";
+        fs::write(&hist_file, content).unwrap();
+
+        let mut m = Model::default();
+        let now = 100_000;
+        let home = tmp_dir.to_string_lossy().to_string();
+        m.bootstrap_from_history(&hist_file, &home, now);
+
+        // 1. Timestamps must not appear in lines
+        assert_eq!(m.lines.len(), 2);
+        assert_eq!(m.lines[0].text, "git status");
+        assert_eq!(m.lines[1].text, "git commit -m \"initial\"");
+        assert!(!m.lines.iter().any(|l| l.text.starts_with('#')));
+
+        // 2. Transition from "git status" to "git commit" must exist directly
+        let shape1 = line_shape("git status");
+        let shape2 = line_shape("git commit -m \"initial\"");
+        assert!(m.shape_bigram.contains_key(&(shape1, shape2)), "adjacent transition across timestamp must be recorded");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
