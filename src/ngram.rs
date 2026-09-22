@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::util::{expand_home, fnv1a64, is_path_shaped, now_secs};
+use crate::util::{escape_path_suffix, expand_home, fnv1a64, is_path_shaped, last_shell_word, now_secs};
 use crate::vocab::Vocab;
 
 const MAGIC: &[u8; 4] = b"BPM5";
@@ -225,10 +225,12 @@ impl Model {
             return ('\0', String::new());
         }
 
-        let prefix = tokens[tokens.len() - 1];
-        if is_path_shaped(prefix) {
-            if let Some(rest) = self.fs_complete_path(prefix, cwd, now) {
-                return ('F', rest);
+        let last_word = last_shell_word(partial);
+        if is_path_shaped(&last_word) {
+            if let Some(rest) = self.fs_complete_path(&last_word, cwd, now) {
+                if let Some(escaped) = escape_path_suffix(partial, &rest) {
+                    return ('F', escaped);
+                }
             }
         }
 
@@ -508,10 +510,12 @@ impl Model {
                 out.push((tag, self.vocab.text(id).to_string()));
             }
             if !partial.ends_with(' ') && !tokens.is_empty() {
-                let prefix = tokens[tokens.len() - 1];
-                if is_path_shaped(prefix) {
-                    if let Some(rest) = self.fs_complete_path(prefix, cwd, now) {
-                        out.push(('F', rest));
+                let last_word = last_shell_word(partial);
+                if is_path_shaped(&last_word) {
+                    if let Some(rest) = self.fs_complete_path(&last_word, cwd, now) {
+                        if let Some(escaped) = escape_path_suffix(partial, &rest) {
+                            out.push(('F', escaped));
+                        }
                     }
                 }
                 if out.is_empty() {
@@ -827,6 +831,31 @@ mod tests {
 
         let (tag, _) = m.predict_with(&format!("cat {d}/zzz"), "", now, false, None);
         assert_eq!(tag, '\0');
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_completion_escapes_special_characters_and_quotes() {
+        let dir = std::env::temp_dir().join(format!("fscomp-esc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::File::create(dir.join("hello world.txt")).unwrap();
+        let m = Model::default();
+        let now = 10_000u64;
+        let d = dir.to_string_lossy().to_string();
+
+        // Unquoted with space in suffix should escape space
+        let (tag, suffix) = m.predict_with(&format!("cat {d}/hello"), "", now, false, None);
+        assert_eq!((tag, suffix.as_str()), ('F', "\\ world.txt"));
+
+        // Double quoted should not backslash-escape space, but finish closing quote
+        let (tag, suffix) = m.predict_with(&format!("cat \"{d}/hello"), "", now, false, None);
+        assert_eq!((tag, suffix.as_str()), ('F', " world.txt\""));
+
+        // Single quoted should finish closing quote
+        let (tag, suffix) = m.predict_with(&format!("cat '{d}/hello"), "", now, false, None);
+        assert_eq!((tag, suffix.as_str()), ('F', " world.txt'"));
 
         let _ = fs::remove_dir_all(&dir);
     }
