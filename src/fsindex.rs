@@ -370,7 +370,11 @@ impl FsIndex {
 
         let mut prev = "";
         for (p, is_dir) in &self.paths {
-            let common = common_prefix_len(prev, p);
+            let common = common_prefix_len(prev, p).min(u16::MAX as usize);
+            let mut common = common;
+            while !p.is_char_boundary(common) {
+                common -= 1;
+            }
             let suffix = &p[common..];
             if suffix.len() > u16::MAX as usize {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "path suffix too long for fsindex.bin (u16 length prefix)"));
@@ -425,12 +429,12 @@ impl FsIndex {
             let mut is_dir_buf = [0u8; 1];
             r.read_exact(&mut is_dir_buf)?;
 
-            if common > prev.len() {
+            if common > prev.len() || !prev.is_char_boundary(common) {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "fsindex.bin bad front-coding offset"));
             }
             let mut s = String::with_capacity(common + suffix_len);
             s.push_str(&prev[..common]);
-            s.push_str(&String::from_utf8_lossy(&suffix));
+            s.push_str(std::str::from_utf8(&suffix).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
             paths.push((s.clone(), is_dir_buf[0] != 0));
             prev = s;
         }
@@ -440,7 +444,11 @@ impl FsIndex {
 }
 
 fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+    let mut n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    while !a.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
 }
 
 fn read_u16<R: Read>(r: &mut R) -> io::Result<u16> {
@@ -563,6 +571,15 @@ mod tests {
 
         assert_eq!(loaded.paths, index.paths);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn unicode_front_coding_round_trip() {
+        let index = idx(&[("/h/è", false), ("/h/é", false), ("/h/😀/é", true)]);
+        let tmp = std::env::temp_dir().join(format!("bp-fsindex-unicode-{}.bin", std::process::id()));
+        index.save(&tmp).unwrap();
+        assert_eq!(FsIndex::load(&tmp).unwrap().paths, index.paths);
+        std::fs::remove_file(tmp).unwrap();
     }
 
     #[test]
