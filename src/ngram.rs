@@ -3,10 +3,11 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::util::{escape_path_suffix, expand_home, fnv1a64, is_path_shaped, last_shell_word, now_secs};
+use crate::util::{atomic_write, escape_path_suffix, expand_home, fnv1a64, is_path_shaped, last_shell_word, now_secs};
 use crate::vocab::Vocab;
 
-const MAGIC: &[u8; 4] = b"BPM5";
+const MAGIC: &[u8; 4] = b"BPM6";
+const LEGACY_MAGIC5: &[u8; 4] = b"BPM5";
 const LEGACY_MAGIC4: &[u8; 4] = b"BPM4";
 const LEGACY_MAGIC: &[u8; 4] = b"BPM2";
 const LEGACY_MAGIC3: &[u8; 4] = b"BPM3";
@@ -655,7 +656,7 @@ impl Model {
 
         write_u32(&mut body, self.vocab.strings.len() as u32)?;
         for s in &self.vocab.strings {
-            write_str_u16(&mut body, s)?;
+            write_str_u32(&mut body, s)?;
         }
 
         for &c in &self.word_freq {
@@ -688,10 +689,10 @@ impl Model {
             write_u32(&mut body, entry.count)?;
             write_f64(&mut body, entry.weight)?;
             write_u64(&mut body, entry.last_used)?;
-            write_str_u16(&mut body, &entry.text)?;
+            write_str_u32(&mut body, &entry.text)?;
             write_u32(&mut body, entry.cwd_counts.len() as u32)?;
             for (cwd, &cnt) in &entry.cwd_counts {
-                write_str_u16(&mut body, cwd)?;
+                write_str_u32(&mut body, cwd)?;
                 write_u32(&mut body, cnt)?;
             }
         }
@@ -700,7 +701,7 @@ impl Model {
         for (path, &(count, last_used)) in &self.path_freq {
             write_u32(&mut body, count)?;
             write_u64(&mut body, last_used)?;
-            write_str_u16(&mut body, path)?;
+            write_str_u32(&mut body, path)?;
         }
 
         write_u32(&mut body, self.shape_bigram.len() as u32)?;
@@ -712,26 +713,23 @@ impl Model {
         }
 
         let checksum = fnv1a64(&body);
-        let tmp = path.with_extension("bin.tmp");
-        {
-            let mut w = BufWriter::new(File::create(&tmp)?);
+        atomic_write(path, |w| {
             w.write_all(MAGIC)?;
             w.write_all(&body)?;
-            w.write_all(&checksum.to_le_bytes())?;
-            w.flush()?;
-        }
-        std::fs::rename(tmp, path)
+            w.write_all(&checksum.to_le_bytes())
+        })
     }
 
     pub fn load(path: &Path) -> io::Result<Model> {
         let mut raw = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 4];
         raw.read_exact(&mut magic)?;
-        let (legacy2, has_seq, has_weight) = match &magic {
-            MAGIC => (false, true, true),
-            LEGACY_MAGIC4 => (false, true, false),
-            LEGACY_MAGIC3 => (false, false, false),
-            LEGACY_MAGIC => (true, false, false),
+        let (legacy2, has_seq, has_weight, use_u32_str) = match &magic {
+            MAGIC => (false, true, true, true),
+            LEGACY_MAGIC5 => (false, true, true, false),
+            LEGACY_MAGIC4 => (false, true, false, false),
+            LEGACY_MAGIC3 => (false, false, false, false),
+            LEGACY_MAGIC => (true, false, false, false),
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic")),
         };
         let legacy_now = std::fs::metadata(path).and_then(|m| m.modified()).map_or(now_secs(), |t| {
@@ -752,9 +750,16 @@ impl Model {
 
         let mut model = Model::default();
 
+        let mut read_str = |r: &mut &[u8]| -> io::Result<String> {
+            if use_u32_str {
+                read_str_u32(r)
+            } else {
+                read_str_u16(r)
+            }
+        };
         let vocab_len = read_u32(&mut r)?;
         for _ in 0..vocab_len {
-            let s = read_str_u16(&mut r)?;
+            let s = read_str(&mut r)?;
             let id = model.vocab.intern(&s);
             if id as usize != model.vocab.strings.len() - 1 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "model.bin vocab table corrupted"));
@@ -797,12 +802,12 @@ impl Model {
             let count = read_u32(&mut r)?;
             let weight = if has_weight { read_f64(&mut r)? } else { count as f64 };
             let last_used = if legacy2 { legacy_now } else { read_u64(&mut r)? };
-            let text = read_str_u16(&mut r)?;
+            let text = read_str(&mut r)?;
             let mut cwd_counts = HashMap::new();
             if !legacy2 {
                 let n_cwds = read_u32(&mut r)?;
                 for _ in 0..n_cwds {
-                    let cwd = read_str_u16(&mut r)?;
+                    let cwd = read_str(&mut r)?;
                     let cnt = read_u32(&mut r)?;
                     cwd_counts.insert(cwd, cnt);
                 }
@@ -816,7 +821,7 @@ impl Model {
         for _ in 0..n_paths {
             let count = read_u32(&mut r)?;
             let last_used = if legacy2 { legacy_now } else { read_u64(&mut r)? };
-            let path = read_str_u16(&mut r)?;
+            let path = read_str(&mut r)?;
             model.path_freq.insert(path, (count, last_used));
         }
 
@@ -844,6 +849,21 @@ impl Model {
     }
 }
 
+
+fn write_str_u32<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    if s.len() > u32::MAX as usize {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "string too long for model.bin (u32 length prefix)"));
+    }
+    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    w.write_all(s.as_bytes())
+}
+
+fn read_str_u32<R: Read>(r: &mut R) -> io::Result<String> {
+    let len = read_u32(r)? as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
 fn write_str_u16<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     if s.len() > u16::MAX as usize {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "string too long for model.bin (u16 length prefix)"));
@@ -1323,12 +1343,76 @@ mod tests {
     }
 
     #[test]
-    fn save_rejects_oversized_line() {
+    fn oversized_line_and_later_training_survives_round_trip() {
         let mut m = Model::default();
-        let huge = format!("echo {}", "x".repeat(70_000));
+        let huge_arg = "x".repeat(70_000);
+        let huge = format!("echo {huge_arg}");
         m.train(&huge, "/home/u", "/home/u", 1000);
-        let tmp = std::env::temp_dir().join(format!("bp-model-huge-{}.bin", std::process::id()));
-        assert!(m.save(&tmp).is_err());
+
+        // Ordinary later training
+        m.train("git status", "/home/u", "/home/u", 2000);
+        m.train("git commit -m done", "/home/u", "/home/u", 2001);
+
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp = std::env::temp_dir().join(format!("bp-model-huge-{pid}-{nanos}.bin"));
+
+        m.save(&tmp).expect("BPM6 with u32 strings must save huge command");
+        let loaded = Model::load(&tmp).expect("must load BPM6 huge command model");
+
+        // Verify huge command survived
+        assert_eq!(loaded.lines.len(), 3);
+        assert_eq!(loaded.lines[0].text, huge);
+        assert_eq!(loaded.lines[1].text, "git status");
+        assert_eq!(loaded.lines[2].text, "git commit -m done");
+
+        // Verify prediction works for both huge command and later commands
+        let (tag_huge, suffix_huge) = loaded.predict_with(&format!("echo {}", &huge_arg[..10]), "", 3000, true, None);
+        assert_eq!(tag_huge, 'L');
+        assert_eq!(suffix_huge, huge_arg[10..]);
+
+        let (tag_git, suffix_git) = loaded.predict_with("git st", "", 3000, true, None);
+        assert_eq!(tag_git, 'L');
+        assert_eq!(suffix_git, "atus");
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn loads_legacy_bpm5() {
+        let mut body = Vec::new();
+        body.extend(1u32.to_le_bytes());
+        body.extend(3u16.to_le_bytes());
+        body.extend(b"git");
+        body.extend(1u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        body.extend(1u32.to_le_bytes());
+        body.extend(1u32.to_le_bytes());
+        body.extend(1.0f64.to_le_bytes());
+        body.extend(42u64.to_le_bytes());
+        body.extend(3u16.to_le_bytes());
+        body.extend(b"git");
+        body.extend(0u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp = std::env::temp_dir().join(format!("bp-model-bpm5-{pid}-{nanos}.bin"));
+        let mut file = Vec::new();
+        file.extend(b"BPM5");
+        file.extend(&body);
+        file.extend(fnv1a64(&body).to_le_bytes());
+        std::fs::write(&tmp, &file).unwrap();
+
+        let m = Model::load(&tmp).unwrap();
+        assert_eq!(m.lines.len(), 1);
+        assert_eq!(m.lines[0].text, "git");
+        assert_eq!(m.lines[0].count, 1);
+        assert_eq!(m.lines[0].weight, 1.0);
+        assert_eq!(m.lines[0].last_used, 42);
+
         std::fs::remove_file(&tmp).ok();
     }
 
