@@ -49,41 +49,254 @@ pub fn expand_home(token: &str, home: &str, cwd: Option<&str>) -> Option<String>
     }
 }
 
-pub fn last_shell_word(line: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteStyle {
+    Single,
+    Double,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellLineState {
+    words: Vec<String>,
+    open_quote: Option<QuoteStyle>,
+    trailing_escape: bool,
+    started: bool,
+}
+
+fn parse_shell_line(line: &str) -> ShellLineState {
     let mut words: Vec<String> = vec![String::new()];
     let mut chars = line.chars().peekable();
-    let mut quote: Option<char> = None;
+    let mut open_quote: Option<QuoteStyle> = None;
+    let mut trailing_escape = false;
     let mut started = false;
 
     while let Some(c) = chars.next() {
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            } else if q == '"' && c == '\\' && matches!(chars.peek(), Some('"' | '\\' | '$')) {
-                words.last_mut().unwrap().push(chars.next().unwrap());
-            } else {
-                words.last_mut().unwrap().push(c);
-            }
-            started = true;
-        } else if c == '\'' || c == '"' {
-            quote = Some(c);
-            started = true;
-        } else if c == '\\' {
-            if let Some(next) = chars.next() {
-                words.last_mut().unwrap().push(next);
+        trailing_escape = false;
+        match open_quote {
+            Some(QuoteStyle::Single) => {
+                if c == '\'' {
+                    open_quote = None;
+                } else {
+                    words.last_mut().unwrap().push(c);
+                }
                 started = true;
             }
-        } else if c.is_whitespace() {
-            if started {
-                words.push(String::new());
-                started = false;
+            Some(QuoteStyle::Double) => {
+                if c == '"' {
+                    open_quote = None;
+                } else if c == '\\' {
+                    if let Some(&next) = chars.peek() {
+                        if matches!(next, '"' | '\\' | '$' | '`') {
+                            words.last_mut().unwrap().push(chars.next().unwrap());
+                        } else if next == '\n' {
+                            chars.next();
+                        } else {
+                            words.last_mut().unwrap().push('\\');
+                        }
+                    } else {
+                        trailing_escape = true;
+                    }
+                } else {
+                    words.last_mut().unwrap().push(c);
+                }
+                started = true;
             }
-        } else {
-            words.last_mut().unwrap().push(c);
-            started = true;
+            None => {
+                if c == '\'' {
+                    open_quote = Some(QuoteStyle::Single);
+                    started = true;
+                } else if c == '"' {
+                    open_quote = Some(QuoteStyle::Double);
+                    started = true;
+                } else if c == '\\' {
+                    if let Some(next) = chars.next() {
+                        if next != '\n' {
+                            words.last_mut().unwrap().push(next);
+                        }
+                    } else {
+                        trailing_escape = true;
+                    }
+                    started = true;
+                } else if c.is_whitespace() {
+                    if started {
+                        words.push(String::new());
+                        started = false;
+                    }
+                } else {
+                    words.last_mut().unwrap().push(c);
+                    started = true;
+                }
+            }
         }
     }
-    words.pop().unwrap_or_default()
+
+    ShellLineState {
+        words,
+        open_quote,
+        trailing_escape,
+        started,
+    }
+}
+
+pub fn last_shell_word(line: &str) -> String {
+    let mut state = parse_shell_line(line);
+    state.words.pop().unwrap_or_default()
+}
+
+fn needs_unquoted_escape(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '\\' | '\'' | '"' | '$' | '`' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#' | '=' | '!' | '^'
+        )
+}
+
+pub fn escape_path_suffix(line: &str, suffix: &str) -> Option<String> {
+    if suffix.contains('\0') {
+        return None;
+    }
+
+    let state = parse_shell_line(line);
+    let mut out = String::new();
+
+    match state.open_quote {
+        Some(QuoteStyle::Single) => {
+            for c in suffix.chars() {
+                if c == '\'' {
+                    out.push_str(r"'\''");
+                } else {
+                    out.push(c);
+                }
+            }
+            out.push('\'');
+            Some(out)
+        }
+        Some(QuoteStyle::Double) => {
+            let mut chars = suffix.chars();
+            if state.trailing_escape {
+                let first = chars.next()?;
+                if matches!(first, '"' | '\\' | '$' | '`') {
+                    out.push(first);
+                } else {
+                    return None;
+                }
+            }
+            let mut in_dq = true;
+            for c in chars {
+                if c == '!' {
+                    if in_dq {
+                        out.push('"');
+                        in_dq = false;
+                    }
+                    out.push('\'');
+                    out.push('!');
+                    out.push('\'');
+                } else {
+                    if !in_dq {
+                        out.push('"');
+                        in_dq = true;
+                    }
+                    if matches!(c, '"' | '\\' | '$' | '`') {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+            }
+            if in_dq {
+                out.push('"');
+            }
+            Some(out)
+        }
+        None => {
+            let mut chars = suffix.chars();
+            if state.trailing_escape {
+                let first = chars.next()?;
+                if first == '\n' {
+                    return None;
+                }
+                out.push(first);
+            }
+            for c in chars {
+                if c == '\n' {
+                    out.push_str("'\n'");
+                } else if needs_unquoted_escape(c) {
+                    out.push('\\');
+                    out.push(c);
+                } else {
+                    out.push(c);
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+pub fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("foresight");
+    let pid = std::process::id();
+
+    let mut tmp_path = None;
+    let mut file = None;
+    let mut attempts = 0;
+    while attempts < 100 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let candidate = parent.join(format!(".{file_stem}.tmp.{pid}.{nanos}.{attempts}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                tmp_path = Some(candidate);
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let tmp_path = tmp_path.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to create unique temporary file for atomic write after 100 attempts",
+        )
+    })?;
+    let file = file.unwrap();
+
+    struct TempCleanup<'a>(&'a Path, bool);
+    impl<'a> Drop for TempCleanup<'a> {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+
+    let mut cleanup = TempCleanup(&tmp_path, true);
+
+    {
+        let mut writer = std::io::BufWriter::new(file);
+        write(&mut writer)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    cleanup.1 = false;
+    Ok(())
 }
 
 pub fn fnv1a64(data: &[u8]) -> u64 {
@@ -166,5 +379,107 @@ mod tests {
     fn fnv1a64_is_deterministic() {
         assert_eq!(fnv1a64(b"hello"), fnv1a64(b"hello"));
         assert_ne!(fnv1a64(b"hello"), fnv1a64(b"hellp"));
+    }
+
+    fn bash_last_arg(cmd: &str) -> String {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {cmd}"))
+            .output()
+            .expect("bash execution failed");
+        let stdout = output.stdout;
+        let mut last = String::new();
+        for part in stdout.split(|&b| b == 0) {
+            if !part.is_empty() {
+                last = String::from_utf8_lossy(part).to_string();
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn escape_path_suffix_real_shell_argv_assertions() {
+        let cases = [
+            // Unquoted with spaces and shell punctuation
+            ("cat foo", " bar;baz&qux|zap$1", "foo bar;baz&qux|zap$1"),
+            // Unquoted with embedded newline
+            ("cat foo", " bar\nbaz", "foo bar\nbaz"),
+            // Open single quote with internal single quote and spaces
+            ("cat 'foo", " bar's", "foo bar's"),
+            // Open double quote with $ and ! (protects against interactive history expansion)
+            ("cat \"foo", " bar!baz$1", "foo bar!baz$1"),
+            // Closed quotes followed by unquoted space
+            ("cat \"foo\"", " bar", "foo bar"),
+            // Unquoted trailing escape continuation
+            ("cat foo\\", " bar", "foo bar"),
+        ];
+        for (line, suffix, expected) in cases {
+            let esc = escape_path_suffix(line, suffix).expect("should escape");
+            let full = format!("{line}{esc}");
+            assert_eq!(bash_last_arg(&full), expected);
+        }
+    }
+
+    #[test]
+    fn escape_path_suffix_dangling_escape_and_unrepresentable() {
+        // Valid continuation after trailing backslash
+        let esc = escape_path_suffix("cat foo\\", " bar").unwrap();
+        assert_eq!(bash_last_arg(&format!("cat foo\\{esc}")), "foo bar");
+
+        // Dangling backslash with empty suffix cannot represent empty append
+        assert_eq!(escape_path_suffix("cat foo\\", ""), None);
+        // Dangling backslash followed by newline is line continuation, impossible for literal newline
+        assert_eq!(escape_path_suffix("cat foo\\", "\n"), None);
+        // Null byte impossible in shell
+        assert_eq!(escape_path_suffix("cat foo", "bar\0baz"), None);
+        // Double quote with trailing escape and invalid char
+        assert_eq!(escape_path_suffix("cat \"foo\\", "a"), None);
+    }
+
+    #[test]
+    fn atomic_write_creates_and_overwrites() {
+        let pid = std::process::id();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("foresight_test_{pid}_{nanos}"));
+        let target = tmp_dir.join("test_file.txt");
+        atomic_write(&target, |w| {
+            w.write_all(b"hello atomic")?;
+            Ok(())
+        }).expect("atomic write should succeed");
+
+        let contents = std::fs::read_to_string(&target).expect("target must exist");
+        assert_eq!(contents, "hello atomic");
+
+        // Overwrite
+        atomic_write(&target, |w| {
+            w.write_all(b"overwritten")?;
+            Ok(())
+        }).expect("atomic overwrite should succeed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "overwritten");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_on_failure() {
+        let pid = std::process::id();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("foresight_fail_{pid}_{nanos}"));
+        let target = tmp_dir.join("target.txt");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(&target, "original").unwrap();
+
+        let res = atomic_write(&target, |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "write error"))
+        });
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+
+        // Check no tmp files left in directory
+        let entries: Vec<_> = std::fs::read_dir(&tmp_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_name(), "target.txt");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
