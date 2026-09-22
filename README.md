@@ -116,22 +116,26 @@ foresight's predictions show as the ghost automatically.
 
 ### Training
 
-Commands are trained the moment they run — a `DEBUG`-trap preexec in bash, a
-`preexec` hook in zsh, and ble.sh's `PREEXEC` event under ble.sh all feed the
-model with the exact command about to be executed. That means `HISTIGNORE` and
-`HISTCONTROL` settings can't desync the model the way history-reading hooks do.
+Commands are trained the moment they run — a Readline capture plus `PS0`
+preexec in bash, a `preexec` hook in zsh, and ble.sh's `PREEXEC` event under
+ble.sh all feed the model with the exact command about to be executed — so
+`HISTIGNORE` and `HISTCONTROL` can never desync the model, and multiline
+compounds train once, byte-for-byte. Predictions travel over one persistent
+shell-owned helper, so per-session context (cwd, session id) stays accurate.
 
 ## Staying up to date
 
 ```bash
 foresight update              # grab the latest version on your channel
-foresight update --check      # just check, don't install
+foresight update --check      # just check, don't install (read-only)
 foresight update --enable-silent   # let it update itself quietly in the background
 ```
 
 foresight ships on three channels — `stable`, `beta`, and `dev`. You stay on whichever
 one you installed until you deliberately switch with `foresight update --channel beta`;
-after that, updates (including silent ones) keep following that channel.
+after that, updates (including silent ones) keep following that channel. Versions are
+compared with semantic precedence, so re-checks never churn your install, and a failed
+download/checksum/swap leaves both the binary and your pinned configuration untouched.
 
 Silent updates, when enabled, are checked once a day, verified with a checksum before
 installing, and only ever come from this repo.
