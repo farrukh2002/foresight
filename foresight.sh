@@ -92,7 +92,11 @@ __foresight_predict() {
         __foresight_coproc_owner=$BASHPID
     fi
     if [[ -z $__foresight_coproc_pid ]]; then
-        coproc __foresight_stream { exec "$FORESIGHT_BIN" stream 2>/dev/null; }
+        # The group's stderr redirect silences the job-control announcement
+        # ("[1] PID") interactive bash prints for a freshly spawned coproc;
+        # disown suppresses the matching Done/Exit notice if the helper dies.
+        { coproc __foresight_stream { exec "$FORESIGHT_BIN" stream 2>/dev/null; }
+          disown "$__foresight_stream_PID" 2>/dev/null || : ;} 2>/dev/null
         __foresight_coproc_pid=$__foresight_stream_PID
         if ! { exec {__foresight_coproc_in}>&${__foresight_stream[1]} {__foresight_coproc_out}<&${__foresight_stream[0]}; } 2>/dev/null; then
             __foresight_coproc_kill

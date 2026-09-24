@@ -106,7 +106,8 @@ _ble_contrib_foresight_predict() {
     _ble_contrib_foresight_coproc_owner=$BASHPID
   fi
   if [[ -z $_ble_contrib_foresight_coproc_pid ]]; then
-    coproc _ble_contrib_foresight_stream { exec "$_ble_contrib_foresight_bin" stream 2>/dev/null; }
+    { coproc _ble_contrib_foresight_stream { exec "$_ble_contrib_foresight_bin" stream 2>/dev/null; }
+      disown "$_ble_contrib_foresight_stream_PID" 2>/dev/null || : ;} 2>/dev/null
     _ble_contrib_foresight_coproc_pid=$_ble_contrib_foresight_stream_PID
     if ! { exec {_ble_contrib_foresight_coproc_in}>&${_ble_contrib_foresight_stream[1]} {_ble_contrib_foresight_coproc_out}<&${_ble_contrib_foresight_stream[0]}; } 2>/dev/null; then
       _ble_contrib_foresight_coproc_kill
