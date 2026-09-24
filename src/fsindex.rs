@@ -30,7 +30,7 @@ impl FsIndex {
     }
 
 
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(test)]
     pub fn contains(&self, abs: &str) -> bool {
         self.paths.binary_search_by(|(p, _)| p.as_str().cmp(abs)).is_ok()
     }

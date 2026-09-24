@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
 use crate::util::{atomic_write, escape_path_suffix, expand_home, fnv1a64, is_path_shaped, last_shell_word, now_secs};
@@ -149,6 +149,7 @@ impl Model {
         }
     }
 
+    #[cfg(test)]
     fn add_line_votes(&mut self, text: &str, sign: i64) {
         let ids: Vec<u32> = text.split_whitespace().filter_map(|w| self.vocab.get(w)).collect();
         for &id in &ids {
@@ -195,6 +196,7 @@ impl Model {
         self.shape_bigram.get(&(prev, cur)).map_or(0.0, |&(c, last)| c as f64 * recency_weight(last, now))
     }
 
+    #[cfg(test)]
     pub fn holdout_predict(&mut self, idx: usize, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>) -> (char, String) {
         if idx >= self.lines.len() {
             return ('\0', String::new());
@@ -421,13 +423,6 @@ impl Model {
             }
         }
         best.map(|(_, w)| w.to_string())
-    }
-
-    #[cfg(feature = "bench")]
-    pub fn top_cwd(&self, idx: usize) -> Option<&str> {
-        self.lines.get(idx).and_then(|e| {
-            e.cwd_counts.iter().max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0))).map(|(c, _)| c.as_str())
-        })
     }
 
     pub fn accept_boost(&mut self, line: &str, now: u64) -> bool {
@@ -750,7 +745,7 @@ impl Model {
 
         let mut model = Model::default();
 
-        let mut read_str = |r: &mut &[u8]| -> io::Result<String> {
+        let read_str = |r: &mut &[u8]| -> io::Result<String> {
             if use_u32_str {
                 read_str_u32(r)
             } else {
@@ -863,13 +858,6 @@ fn read_str_u32<R: Read>(r: &mut R) -> io::Result<String> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).to_string())
-}
-fn write_str_u16<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    if s.len() > u16::MAX as usize {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "string too long for model.bin (u16 length prefix)"));
-    }
-    w.write_all(&(s.len() as u16).to_le_bytes())?;
-    w.write_all(s.as_bytes())
 }
 
 fn write_u64<W: Write>(w: &mut W, v: u64) -> io::Result<()> {
