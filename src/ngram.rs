@@ -14,6 +14,7 @@ const LEGACY_MAGIC3: &[u8; 4] = b"BPM3";
 
 const HALF_LIFE_DAYS: f64 = 14.0;
 const CWD_BONUS: f64 = 2.0;
+const SESSION_LINE_BONUS: f64 = 2.0;
 const CONTEXT_WEIGHT: f64 = 8.0;
 const SEQ_BONUS: f64 = 8.0;
 const CHAIN_MAX_WORDS: usize = 3;
@@ -207,7 +208,7 @@ impl Model {
         self.add_line_votes(&text, -1);
         self.lines[idx].count = old_count.saturating_sub(1);
         self.lines[idx].weight = (old_weight - 1.0).max(0.0);
-        let result = self.predict_with(partial, cwd, now, true, prev_shape);
+        let result = self.predict_with_session(partial, cwd, now, true, prev_shape, None);
         self.lines[idx].count = old_count;
         self.lines[idx].weight = old_weight;
         self.add_line_votes(&text, 1);
@@ -215,16 +216,25 @@ impl Model {
     }
 
     #[cfg(test)]
-    pub fn predict(&self, partial: &str, cwd: &str, now: u64) -> (char, String) {
-        self.predict_with(partial, cwd, now, true, None)
+    pub fn predict_with(&self, partial: &str, cwd: &str, now: u64, allow_word_prefix: bool, prev_shape: Option<u64>) -> (char, String) {
+        self.predict_with_session(partial, cwd, now, allow_word_prefix, prev_shape, None)
     }
 
-    pub fn predict_with(&self, partial: &str, cwd: &str, now: u64, allow_word_prefix: bool, prev_shape: Option<u64>) -> (char, String) {
+    #[cfg(test)]
+    pub fn predict(&self, partial: &str, cwd: &str, now: u64) -> (char, String) {
+        self.predict_with_session(partial, cwd, now, true, None, None)
+    }
+
+    /// Session-aware prediction: `session_words` holds vocab ids for argument
+    /// tokens seen earlier in the current shell session (branch names, pod
+    /// names, paths). Candidates reusing them win ties against the global
+    /// vote; the word-level fallback path boosts them the same way.
+    pub fn predict_with_session(&self, partial: &str, cwd: &str, now: u64, allow_word_prefix: bool, prev_shape: Option<u64>, session_words: Option<&HashSet<u32>>) -> (char, String) {
         if partial.is_empty() {
             return ('\0', String::new());
         }
 
-        if let Some(cont) = self.best_line_continuation(partial, cwd, now, prev_shape) {
+        if let Some(cont) = self.best_line_continuation(partial, cwd, now, prev_shape, session_words) {
             return ('L', cont);
         }
 
@@ -234,7 +244,16 @@ impl Model {
 
         if ends_with_space || tokens.is_empty() {
             let ctx_ids = self.contiguous_context_ids(&tokens, 2);
-            let boost = self.seq_boost_words(prev_shape, now);
+            let mut boost = self.seq_boost_words(prev_shape, now);
+            if let Some(sw) = session_words {
+                boost = Some(match boost {
+                    Some(mut b) => {
+                        b.extend(sw.iter().copied());
+                        b
+                    }
+                    None => sw.clone(),
+                });
+            }
             if let Some((tag, word_id, prob, margin)) = self.backoff_next_word(&ctx_ids, boost.as_ref()) {
                 let gate_ok = match tag {
                     'T' => prob >= T_MIN_P,
@@ -279,7 +298,7 @@ impl Model {
         ('\0', String::new())
     }
 
-    fn line_score(entry: &LineEntry, cwd: &str, now: u64, seq: f64) -> f64 {
+    fn line_score(&self, entry: &LineEntry, cwd: &str, now: u64, seq: f64, session_words: Option<&HashSet<u32>>) -> f64 {
         let mut score = entry.weight * recency_weight(entry.last_used, now);
         if seq > 0.0 {
             score *= 1.0 + SEQ_BONUS * (seq / (1.0 + seq));
@@ -287,14 +306,23 @@ impl Model {
         if !cwd.is_empty() && entry.cwd_counts.keys().any(|c| cwd == c || cwd.starts_with(&format!("{c}/")) || c.starts_with(&format!("{cwd}/"))) {
             score += CWD_BONUS;
         }
+        // A candidate reusing an argument from earlier in this session (the
+        // branch you checked out, the pod you inspected) is what the user is
+        // most plausibly about to type again. Multiplicative so the edge
+        // survives large histories where global vote counts grow.
+        if let Some(sw) = session_words {
+            if entry.text.split_whitespace().filter_map(|w| self.vocab.get(w)).any(|id| sw.contains(&id)) {
+                score *= 1.0 + SESSION_LINE_BONUS;
+            }
+        }
         score
     }
 
-    fn best_line_continuation(&self, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>) -> Option<String> {
-        self.topk_line_continuations(partial, cwd, now, prev_shape, 1).into_iter().next()
+    fn best_line_continuation(&self, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>, session_words: Option<&HashSet<u32>>) -> Option<String> {
+        self.topk_line_continuations(partial, cwd, now, prev_shape, session_words, 1).into_iter().next()
     }
 
-    fn topk_line_continuations(&self, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>, k: usize) -> Vec<String> {
+    fn topk_line_continuations(&self, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>, session_words: Option<&HashSet<u32>>, k: usize) -> Vec<String> {
         let start = self.sorted_line_ids.partition_point(|&i| self.lines[i as usize].text.as_str() < partial);
         let mut scored: Vec<(f64, &str)> = Vec::new();
         for &id in &self.sorted_line_ids[start..] {
@@ -306,7 +334,7 @@ impl Model {
                 continue;
             }
             let seq = prev_shape.map_or(0.0, |p| self.seq_strength(p, entry.shape, now));
-            scored.push((Self::line_score(entry, cwd, now, seq), entry.text.as_str()));
+            scored.push((self.line_score(entry, cwd, now, seq, session_words), entry.text.as_str()));
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(b.1)));
         scored.truncate(k);
@@ -485,7 +513,7 @@ impl Model {
 
     pub fn explain(&self, partial: &str, cwd: &str, now: u64, prev_shape: Option<u64>) -> String {
         let mut parts = Vec::new();
-        let conts = self.topk_line_continuations(partial, cwd, now, prev_shape, 3);
+        let conts = self.topk_line_continuations(partial, cwd, now, prev_shape, None, 3);
         if conts.is_empty() {
             parts.push("L: none".to_string());
         } else {
@@ -532,9 +560,9 @@ impl Model {
         parts.join("; ")
     }
 
-    pub fn topk(&self, partial: &str, cwd: &str, now: u64, k: usize, prev_shape: Option<u64>) -> Vec<(char, String)> {
+    pub fn topk(&self, partial: &str, cwd: &str, now: u64, k: usize, prev_shape: Option<u64>, session_words: Option<&HashSet<u32>>) -> Vec<(char, String)> {
         let mut out: Vec<(char, String)> = Vec::new();
-        for c in self.topk_line_continuations(partial, cwd, now, prev_shape, k) {
+        for c in self.topk_line_continuations(partial, cwd, now, prev_shape, session_words, k) {
             if out.len() >= k {
                 break;
             }
@@ -948,7 +976,7 @@ mod tests {
         // A quoted space is part of the path, not an n-gram word boundary.
         let prefix = format!("cat '{d}/hello ");
         assert_eq!(m.predict_with(&prefix, "", now, false, None), ('F', "world.txt'".into()));
-        assert_eq!(m.topk(&prefix, "", now, 5, None), vec![('F', "world.txt'".into())]);
+        assert_eq!(m.topk(&prefix, "", now, 5, None, None), vec![('F', "world.txt'".into())]);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1014,7 +1042,7 @@ mod tests {
 
         // When partial is "status" without trailing space and without matching line prefix:
         // topk must NOT return "ready" without space!
-        let results = m.topk("status", "", now, 5, None);
+        let results = m.topk("status", "", now, 5, None, None);
         for (_tag, cont) in &results {
             assert_ne!(cont, "ready", "must never append bare ready into statusready");
             let full = format!("status{cont}");
@@ -1023,7 +1051,7 @@ mod tests {
 
         // When partial is "status " WITH trailing space:
         // topk can suggest "ready" because "status " + "ready" = "status ready"
-        let results_sp = m.topk("status ", "", now, 5, None);
+        let results_sp = m.topk("status ", "", now, 5, None, None);
         let has_ready = results_sp.iter().any(|(_, s)| s.starts_with("ready"));
         assert!(has_ready, "should suggest ready when space is present");
     }
@@ -1055,6 +1083,20 @@ mod tests {
         assert!(m.shape_bigram.contains_key(&(shape1, shape2)), "adjacent transition across timestamp must be recorded");
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn session_carryover_prefers_session_value_over_global_favorite() {
+        let mut m = Model::default();
+        let mut now = 1_000u64;
+        for _ in 0..2 { m.train("git push origin main", "/h", "/p", now); now += 1; }
+        m.train("git push origin feature/auth", "/h", "/p", now); now += 1;
+        let session: HashSet<u32> = std::iter::once(m.vocab.get("feature/auth").unwrap()).collect();
+        let (tag, suffix) = m.predict_with_session("git p", "/p", now, true, None, Some(&session));
+        assert_eq!(tag, 'L');
+        assert_eq!(suffix, "ush origin feature/auth", "session value must beat the global favorite");
+        let (_, plain) = m.predict_with("git p", "/p", now, true, None);
+        assert_eq!(plain, "ush origin main", "without session context the global favorite wins");
     }
 
     #[test]

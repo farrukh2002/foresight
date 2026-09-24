@@ -57,8 +57,21 @@ struct AppState {
     accepts: AtomicU64,
 }
 
-#[derive(Default, Clone, Copy)]
-struct SessionTail { last_shape: u64, last_time: u64 }
+#[derive(Default, Clone)]
+struct SessionTail { last_shape: u64, last_time: u64, recent: Vec<String> }
+
+/// Argument tokens (skipping the leading verb, len >= 4) from the session's
+/// last lines, mapped to vocab ids. These carry the signal "the user already
+/// picked this branch/pod/path value earlier in this session".
+fn session_word_ids(model: &Model, recent: &[String]) -> Option<std::collections::HashSet<u32>> {
+    if recent.is_empty() { return None; }
+    let ids: std::collections::HashSet<u32> = recent.iter()
+        .flat_map(|line| line.split_whitespace().skip(1))
+        .filter(|w| w.len() >= 4)
+        .filter_map(|w| model.vocab.get(w))
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -356,13 +369,24 @@ fn resolve_prev_shape(state: &AppState, session: &str, now: u64) -> Option<u64> 
     let tail = sessions.get(session)?;
     if now.saturating_sub(tail.last_time) > SESSION_GAP_SECS || tail.last_shape == 0 { None } else { Some(tail.last_shape) }
 }
-fn session_advance(state: &AppState, session: &str, shape: u64, now: u64) -> Option<u64> {
+fn session_recent(state: &AppState, session: &str, now: u64) -> Vec<String> {
+    if session.is_empty() { return Vec::new(); }
+    let sessions = state.sessions.lock();
+    sessions.get(session)
+        .filter(|t| now.saturating_sub(t.last_time) <= SESSION_GAP_SECS)
+        .map(|t| t.recent.clone())
+        .unwrap_or_default()
+}
+fn session_advance(state: &AppState, session: &str, shape: u64, now: u64, line: &str) -> Option<u64> {
     if session.is_empty() || shape == 0 { return None; }
     let mut sessions = state.sessions.lock();
     if sessions.len() > 64 { sessions.retain(|_, t| now.saturating_sub(t.last_time) < SESSION_GAP_SECS * 2); }
     let tail = sessions.entry(session.to_owned()).or_default();
     let prev = if now.saturating_sub(tail.last_time) <= SESSION_GAP_SECS && tail.last_shape != 0 { Some(tail.last_shape) } else { None };
-    *tail = SessionTail { last_shape: shape, last_time: now };
+    tail.last_shape = shape;
+    tail.last_time = now;
+    tail.recent.push(line.to_owned());
+    if tail.recent.len() > 8 { tail.recent.remove(0); }
     prev
 }
 
@@ -379,7 +403,10 @@ fn handle_request(request: &Request, state: &AppState) -> Response {
         }
         "P" => {
             state.predicts.fetch_add(1, Ordering::Relaxed);
-            combined_predict(state, cwd, payload, resolve_prev_shape(state, session, now_secs()))
+            let now = now_secs();
+            let prev = resolve_prev_shape(state, session, now);
+            let recent = session_recent(state, session, now);
+            combined_predict(state, cwd, payload, prev, &recent)
         }
         "T" | "A" => {
             let _guard = state.mutations.lock();
@@ -387,7 +414,7 @@ fn handle_request(request: &Request, state: &AppState) -> Response {
             let now = now_secs();
             if kind == "T" {
                 let shape = line_shape(payload.trim());
-                let prev = session_advance(state, session, shape, now);
+                let prev = session_advance(state, session, shape, now, payload.trim());
                 let mut model = state.model.lock();
                 model.train(payload, &state.home, cwd, now);
                 if let Some(prev) = prev { model.record_transition(prev, shape, now); }
@@ -401,8 +428,10 @@ fn handle_request(request: &Request, state: &AppState) -> Response {
         "PL" => {
             let now = now_secs();
             let prev = resolve_prev_shape(state, session, now);
+            let recent = session_recent(state, session, now);
             let model = state.model.lock();
-            let mut items: Vec<String> = model.topk(payload, cwd, now, 5, prev).into_iter()
+            let session_words = session_word_ids(&model, &recent);
+            let mut items: Vec<String> = model.topk(payload, cwd, now, 5, prev, session_words.as_ref()).into_iter()
                 .map(|(tag, suffix)| format!("{tag}:{suffix}")).collect();
             let paths = index_predictions(state, &model, cwd, payload, now, 3);
             if is_path_shaped(&last_shell_word(payload)) {
@@ -451,14 +480,15 @@ fn index_predictions(state: &AppState, model: &Model, cwd: &str, partial: &str, 
     candidates.into_iter().filter_map(|suffix| escape_path_suffix(partial, &suffix).map(|suffix| format!("P:{suffix}"))).collect()
 }
 
-fn combined_predict(state: &AppState, cwd: &str, partial: &str, prev_shape: Option<u64>) -> String {
+fn combined_predict(state: &AppState, cwd: &str, partial: &str, prev_shape: Option<u64>, recent: &[String]) -> String {
     let now = now_secs();
     let model = state.model.lock();
+    let session_words = session_word_ids(&model, recent);
     let explicit = is_path_shaped(&last_shell_word(partial));
     if explicit {
         if let Some(path) = index_predictions(state, &model, cwd, partial, now, 1).pop() { return path; }
     }
-    let (tag, suffix) = model.predict_with(partial, cwd, now, !explicit, prev_shape);
+    let (tag, suffix) = model.predict_with_session(partial, cwd, now, !explicit, prev_shape, session_words.as_ref());
     if tag != '\0' && (tag != 'F' || explicit) { return format!("{tag}:{suffix}"); }
     if let Some(path) = index_predictions(state, &model, cwd, partial, now, 1).pop() { return path; }
     if tag == '\0' { String::new() } else { format!("{tag}:{suffix}") }
@@ -573,7 +603,7 @@ fn run_bench(n: u64) -> Result<(), String> {
             if let Some((cut, _)) = line.char_indices().nth(line.chars().count() / 2).filter(|(cut, _)| *cut > 0) {
                 let prefix = &line[..cut];
                 let truth = &line[cut..];
-                let (tag, suffix) = model.predict_with(prefix, &home, now, true, prev);
+                let (tag, suffix) = model.predict_with_session(prefix, &home, now, true, prev, None);
                 if tag != '\0' && !suffix.is_empty() {
                     model_offered += 1;
                     model_correct += u64::from(truth.starts_with(&suffix));
