@@ -22,9 +22,9 @@ use parking_lot::{Condvar, Mutex};
 
 use config::Config;
 use fsindex::{FsIndex, Watcher};
-use ngram::{line_shape, Model};
+use ngram::{is_agent_noise, line_shape, Model};
 use protocol::{Reply, Request, Response};
-use util::{data_dir, escape_path_suffix, expand_home, is_path_shaped, last_shell_word, log, now_secs, wants_dirs};
+use util::{data_dir, escape_path_suffix, expand_home, is_path_shaped, last_shell_word, log, now_millis, now_secs, wants_dirs};
 
 const SESSION_GAP_SECS: u64 = 1800;
 
@@ -57,10 +57,11 @@ struct AppState {
     sessions: Mutex<HashMap<String, SessionTail>>,
     predicts: AtomicU64,
     accepts: AtomicU64,
+    train_burst_ms: u64,
 }
 
 #[derive(Default, Clone)]
-struct SessionTail { last_shape: u64, last_time: u64, recent: Vec<String> }
+struct SessionTail { last_shape: u64, last_time: u64, recent: Vec<String>, last_train_ms: u64, burst_until_ms: u64 }
 
 /// Argument tokens (skipping the leading verb, len >= 4) from the session's
 /// last lines, mapped to vocab ids. These carry the signal "the user already
@@ -95,7 +96,7 @@ fn text_reply(reply: Reply) -> Result<String, String> {
 
 fn run(args: Vec<String>) -> Result<(), String> {
     let Some((cmd, rest)) = args.split_first() else {
-        return Err("usage: foresight <serve|ensure-daemon|init|predict|train|accept|list|explain|reindex|stats|version|update|stream>".into());
+        return Err("usage: foresight <serve|ensure-daemon|init|predict|train|accept|list|explain|reindex|stats|prune|version|update|stream>".into());
     };
     match cmd.as_str() {
         "serve" => { no_args(rest)?; serve() }
@@ -120,6 +121,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 out.write_all(if null { b"\0" } else { b"\n" }).map_err(|e| e.to_string())?;
             }
             out.flush().map_err(|e| e.to_string())
+        }
+        "prune" => {
+            let apply = match rest { [] => false, [flag] if flag == "--apply" => true, _ => return Err("usage: foresight prune [--apply]".into()) };
+            println!("{}", text_reply(client_request("PRUNE", "", if apply { "apply" } else { "dry" })?)?);
+            Ok(())
         }
         "reindex" | "stats" => {
             no_args(rest)?;
@@ -269,6 +275,7 @@ fn serve() -> Result<(), String> {
     } else {
         model.seed_transitions_from_history(&history_path(), now_secs());
     }
+    let train_burst_ms = Config::load_or_create(&home).train.burst_ms;
     let state = Arc::new(AppState {
         model: Mutex::new(model),
         fsindex: Arc::new(Mutex::new(FsIndex::load(&fsindex_path()).unwrap_or_else(|_| FsIndex::empty()))),
@@ -276,6 +283,7 @@ fn serve() -> Result<(), String> {
         stopping: AtomicBool::new(false), exit_ready: AtomicBool::new(false),
         reload: Mutex::new(0), wake: Condvar::new(), sessions: Mutex::new(HashMap::new()),
         predicts: AtomicU64::new(0), accepts: AtomicU64::new(0),
+        train_burst_ms,
     });
     { let _guard = state.mutations.lock(); let _ = flush_model(&state); }
     // Bind before the potentially long initial scan. The singleton lock is held
@@ -392,6 +400,15 @@ fn session_recent(state: &AppState, session: &str, now: u64) -> Vec<String> {
         .map(|t| t.recent.clone())
         .unwrap_or_default()
 }
+fn scripted_input(state: &AppState, session: &str, now_ms: u64) -> bool {
+    if state.train_burst_ms == 0 || session.is_empty() { return false; }
+    let mut sessions = state.sessions.lock();
+    let tail = sessions.entry(session.to_owned()).or_default();
+    let scripted = now_ms < tail.burst_until_ms || now_ms.saturating_sub(tail.last_train_ms) < state.train_burst_ms;
+    tail.last_train_ms = now_ms;
+    if scripted { tail.burst_until_ms = now_ms + state.train_burst_ms * 4; }
+    scripted
+}
 fn session_advance(state: &AppState, session: &str, shape: u64, now: u64, line: &str) -> Option<u64> {
     if session.is_empty() || shape == 0 { return None; }
     let mut sessions = state.sessions.lock();
@@ -428,6 +445,7 @@ fn handle_request(request: &Request, state: &AppState) -> Response {
             if state.stopping.load(Ordering::Acquire) { return Err("daemon is shutting down".into()); }
             let now = now_secs();
             if kind == "T" {
+                if is_agent_noise(payload) || scripted_input(state, session, now_millis()) { return Ok(Reply::Text("OK".into())); }
                 let shape = line_shape(payload.trim());
                 let prev = session_advance(state, session, shape, now, payload.trim());
                 let mut model = state.model.lock();
@@ -465,6 +483,11 @@ fn handle_request(request: &Request, state: &AppState) -> Response {
             text.push_str(&format!("; P: {paths:?}"));
             text
         }
+        "PRUNE" => {
+            let _guard = state.mutations.lock();
+            if state.stopping.load(Ordering::Acquire) { return Err("daemon is shutting down".into()); }
+            prune_model(state, payload == "apply")?
+        }
         "REINDEX" => {
             let _guard = state.mutations.lock();
             if state.stopping.load(Ordering::Acquire) { return Err("daemon is shutting down".into()); }
@@ -481,6 +504,30 @@ fn handle_request(request: &Request, state: &AppState) -> Response {
         _ => return Err(format!("unknown request kind: {kind}")),
     };
     Ok(Reply::Text(reply))
+}
+
+fn prune_model(state: &AppState, apply: bool) -> Result<String, String> {
+    let mut model = state.model.lock();
+    let ids = model.scripted_line_ids();
+    let mut report: Vec<String> = ids.iter().map(|&i| {
+        let line = &model.lines[i];
+        let text: String = line.text.chars().take(90).collect();
+        format!("{:>5}  {}", line.count, text)
+    }).collect();
+    report.sort_by(|a, b| b.cmp(a));
+    let events: u64 = ids.iter().map(|&i| model.lines[i].count as u64).sum();
+    if apply && !ids.is_empty() {
+        let backup = data_dir().join(format!("model.bin.pre-prune-{}", now_secs()));
+        if model_path().exists() { std::fs::copy(model_path(), &backup).map_err(|e| format!("backup failed: {e}"))?; }
+        let removed = model.remove_lines(&ids);
+        state.dirty.store(true, Ordering::Release);
+        drop(model);
+        flush_model(state)?;
+        report.push(format!("removed {removed} lines ({events} training events); backup: {}", backup.display()));
+    } else {
+        report.push(format!("{} lines ({events} training events) {}", ids.len(), if apply { "nothing to remove" } else { "would be removed; run `foresight prune --apply`" }));
+    }
+    Ok(report.join("\n"))
 }
 
 fn index_predictions(state: &AppState, model: &Model, cwd: &str, partial: &str, now: u64, count: usize) -> Vec<String> {

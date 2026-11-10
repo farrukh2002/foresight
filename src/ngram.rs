@@ -17,6 +17,9 @@ const LEGACY_MAGIC3: &[u8; 4] = b"BPM3";
 const HALF_LIFE_DAYS: f64 = 14.0;
 const CWD_BONUS: f64 = 2.0;
 const SESSION_LINE_BONUS: f64 = 2.0;
+const BURST_CLUSTER_GAP_SECS: u64 = 30;
+const BURST_CLUSTER_MIN_LINES: usize = 8;
+const BURST_CLUSTER_MIN_COUNT: u32 = 3;
 const CONTEXT_WEIGHT: f64 = 8.0;
 const SEQ_BONUS: f64 = 8.0;
 const CHAIN_MAX_WORDS: usize = 3;
@@ -39,6 +42,19 @@ pub fn line_shape(text: &str) -> u64 {
         h = h.wrapping_mul(31).wrapping_add(fnv1a64(second.as_bytes()));
     }
     if h == 0 { 1 } else { h }
+}
+
+pub fn is_agent_noise(line: &str) -> bool {
+    const MARKERS: [&str; 7] = ["SNAPSHOT_FILE", "__omp_", "/shell-snapshots/", "__ZCODE_", "_SHELL_ENV_DELIMITER_", "/.system_generated/", "__systemd_osc"];
+    MARKERS.iter().any(|m| line.contains(m))
+}
+
+fn command_word(text: &str) -> &str {
+    let mut toks = text.split_whitespace();
+    match toks.next() {
+        Some("sudo") => toks.next().unwrap_or(""),
+        other => other.unwrap_or(""),
+    }
 }
 
 pub fn recency_weight(last_used: u64, now: u64) -> f64 {
@@ -152,7 +168,6 @@ impl Model {
         }
     }
 
-    #[cfg(test)]
     fn add_line_votes(&mut self, text: &str, sign: i64) {
         let ids: Vec<u32> = text.split_whitespace().filter_map(|w| self.vocab.get(w)).collect();
         for &id in &ids {
@@ -870,6 +885,56 @@ impl Model {
         model.rebuild_sorted_lines();
         model.version = 1;
         Ok(model)
+    }
+
+    pub fn scripted_line_ids(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.lines.len()).collect();
+        order.sort_by_key(|&i| self.lines[i].last_used);
+        let mut doomed: HashSet<usize> = (0..self.lines.len()).filter(|&i| is_agent_noise(&self.lines[i].text)).collect();
+        let mut start = 0;
+        for pos in 1..=order.len() {
+            let breaks = pos == order.len() || self.lines[order[pos]].last_used.saturating_sub(self.lines[order[pos - 1]].last_used) > BURST_CLUSTER_GAP_SECS;
+            if breaks {
+                let members = &order[start..pos];
+                if members.len() >= BURST_CLUSTER_MIN_LINES {
+                    doomed.extend(members.iter().copied().filter(|&i| self.lines[i].count >= BURST_CLUSTER_MIN_COUNT && command_word(&self.lines[i].text) != "cd"));
+                }
+                start = pos;
+            }
+        }
+        let mut ids: Vec<usize> = doomed.into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn remove_lines(&mut self, ids: &[usize]) -> usize {
+        let doomed: HashSet<usize> = ids.iter().copied().filter(|&i| i < self.lines.len()).collect();
+        if doomed.is_empty() {
+            return 0;
+        }
+        for &i in &doomed {
+            let text = self.lines[i].text.clone();
+            for _ in 0..self.lines[i].count {
+                self.add_line_votes(&text, -1);
+            }
+        }
+        let removed_shapes: HashSet<u64> = doomed.iter().map(|&i| self.lines[i].shape).collect();
+        let kept_shapes: HashSet<u64> = (0..self.lines.len()).filter(|i| !doomed.contains(i)).map(|i| self.lines[i].shape).collect();
+        self.shape_bigram.retain(|&(a, b), _| {
+            let gone = |s: u64| removed_shapes.contains(&s) && !kept_shapes.contains(&s);
+            !gone(a) && !gone(b)
+        });
+        let mut index = 0;
+        self.lines.retain(|_| {
+            let keep = !doomed.contains(&index);
+            index += 1;
+            keep
+        });
+        self.line_index = self.lines.iter().enumerate().map(|(i, l)| (l.text.clone(), i)).collect();
+        self.rebuild_sorted_lines();
+        self.total_words = self.word_freq.iter().map(|&c| c as u64).sum();
+        self.version += 1;
+        doomed.len()
     }
 
     fn rebuild_sorted_lines(&mut self) {
@@ -1653,5 +1718,29 @@ mod tests {
         let miss = m.accept_boost("never-trained", now);
         assert!(!miss);
         assert!(!m.line_index.contains_key("never-trained"), "accept_boost must not create entries");
+    }
+
+    #[test]
+    fn agent_noise_is_detected_and_scripted_clusters_are_pruned() {
+        assert!(is_agent_noise("head -n 1000 >> \"$SNAPSHOT_FILE\""));
+        assert!(is_agent_noise("unset -f __omp_sq_quote"));
+        assert!(!is_agent_noise("git status"));
+
+        let mut m = Model::default();
+        for i in 0..10u64 {
+            for _ in 0..4 { m.train(&format!("scripted-step-{i}"), "/h", "/p", 5_000 + i); }
+        }
+        for _ in 0..4 { m.train("cd projects", "/h", "/p", 5_003); }
+        for _ in 0..6 { m.train("cargo build", "/h", "/p", 900_000); }
+        for _ in 0..3 { m.train("deploy $SNAPSHOT_FILE", "/h", "/p", 1_500_000); }
+        let doomed = m.scripted_line_ids();
+        let names: HashSet<&str> = doomed.iter().map(|&i| m.lines[i].text.as_str()).collect();
+        assert!(names.contains("scripted-step-3") && names.contains("deploy $SNAPSHOT_FILE"));
+        assert!(!names.contains("cd projects") && !names.contains("cargo build"));
+        assert_eq!(m.remove_lines(&doomed), 11);
+        assert_eq!(m.lines.len(), 2);
+        assert_eq!(m.predict("scripted", "/p", 2_000_000).1, "");
+        assert_eq!(m.predict("cargo b", "/p", 2_000_000), ('L', "uild".into()));
+        assert_eq!(m.predict("cd pro", "/p", 2_000_000), ('L', "jects".into()));
     }
 }

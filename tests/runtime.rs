@@ -9,11 +9,12 @@ use serde_json::{json, Value};
 
 struct Home { path: PathBuf, child: Option<Child> }
 impl Home {
-    fn new() -> Self {
+    fn new() -> Self { Self::with_burst(0) }
+    fn with_burst(burst_ms: u64) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!("foresight-runtime-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(path.join(".config/foresight")).unwrap();
-        fs::write(path.join(".config/foresight/config.toml"), format!("[scan]\nroots = [{}]\n[update]\nmode = 'manual'\n", serde_json::to_string(path.to_str().unwrap()).unwrap())).unwrap();
+        fs::write(path.join(".config/foresight/config.toml"), format!("[scan]\nroots = [{}]\n[update]\nmode = 'manual'\n[train]\nburst_ms = {burst_ms}\n", serde_json::to_string(path.to_str().unwrap()).unwrap())).unwrap();
         Self { path, child: None }
     }
     fn socket(&self) -> PathBuf { self.path.join("daemon.sock") }
@@ -215,5 +216,24 @@ fn filesystem_suffixes_append_as_one_literal_shell_word() {
         assert!(parsed.status.success(), "{}", String::from_utf8_lossy(&parsed.stderr));
         assert_eq!(parsed.stdout, format!("cat\0./{name}\0").as_bytes());
     }
+    home.stop();
+}
+
+#[test]
+fn scripted_bursts_and_agent_noise_are_not_learned() {
+    let mut home = Home::with_burst(300);
+    home.start();
+    assert_eq!(home.request("T", "echo typed-by-hand")["Ok"], "OK");
+    for line in ["echo scripted-one", "echo scripted-two", "echo scripted-three"] {
+        assert_eq!(home.request("T", line)["Ok"], "OK");
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(home.request("T", "head -n 1000 >> \"$SNAPSHOT_FILE\"")["Ok"], "OK");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(home.request("T", "echo typed-later")["Ok"], "OK");
+    assert_eq!(home.request("P", "echo typed-b")["Ok"], "L:y-hand");
+    assert_eq!(home.request("P", "echo typed-l")["Ok"], "L:ater");
+    assert_eq!(home.request("P", "echo scripted-")["Ok"], "");
+    assert_eq!(home.request("P", "head -n 1000 >> ")["Ok"], "");
     home.stop();
 }

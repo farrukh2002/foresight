@@ -8,6 +8,19 @@ use crate::util::log;
 pub struct Config {
     pub scan: ScanConfig,
     pub update: UpdateConfig,
+    pub train: TrainConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TrainConfig {
+    pub burst_ms: u64,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        TrainConfig { burst_ms: 250 }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +115,11 @@ normal_mode_exclude_names = []
 
 # extra paths skipped only in normal mode
 normal_mode_exclude_paths = ["Android", "go", "flutter"]
+
+[train]
+# lines from one shell session arriving closer together than this are treated
+# as scripted input (agent tools, pasted automation) and are not learned; 0 = off
+burst_ms = 250
 
 [update]
 # update mode: "manual" or "silent"
