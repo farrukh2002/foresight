@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -325,6 +325,18 @@ impl FsIndex {
     }
 }
 
+fn name_matches(pattern: &str, name: &std::ffi::OsStr) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.to_str().is_some_and(|n| n.starts_with(prefix)),
+        None => name == std::ffi::OsStr::new(pattern),
+    }
+}
+
+fn path_matches(pattern: &str, rel: &Path) -> bool {
+    let mut parts = rel.components();
+    pattern.split('/').all(|want| parts.next().is_some_and(|got| name_matches(want, got.as_os_str())))
+}
+
 fn common_prefix_len(a: &str, b: &str) -> usize {
     let mut n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     while !a.is_char_boundary(n) {
@@ -423,6 +435,7 @@ struct LiveIndex {
     excludes: Vec<String>,
     own_data: PathBuf,
     cap: usize,
+    dir_limit: usize,
     stop: Arc<AtomicBool>,
 }
 
@@ -432,7 +445,7 @@ impl LiveIndex {
         Ok(Self {
             inotify: Inotify::init()?, watches: HashMap::new(),
             roots: config.resolved_roots(home), names, excludes,
-            own_data: data_dir(), cap: config.max_entries(), stop,
+            own_data: data_dir(), cap: config.max_entries(), dir_limit: config.scan.max_dir_entries.max(1), stop,
         })
     }
 
@@ -442,8 +455,8 @@ impl LiveIndex {
         }
         self.roots.iter().any(|root| {
             let Ok(rel) = path.strip_prefix(root) else { return false };
-            !rel.components().any(|c| self.names.iter().any(|n| c.as_os_str() == std::ffi::OsStr::new(n)))
-                && !self.excludes.iter().any(|p| rel.starts_with(p))
+            !rel.components().any(|c| self.names.iter().any(|n| name_matches(n, c.as_os_str())))
+                && !self.excludes.iter().any(|p| path_matches(p, rel))
         })
     }
 
@@ -458,30 +471,33 @@ impl LiveIndex {
 
     fn scan(&mut self, path: &Path, include_self: bool, budget: usize) -> Vec<(String, bool)> {
         let mut paths = Vec::new();
-        // Keep only one lazy directory iterator per depth, not one allocated
-        // PathBuf per child. A small cap bounds work even in enormous directories.
-        let mut stack: Vec<fs::ReadDir> = Vec::new();
-        let mut next = Some((path.to_path_buf(), include_self));
-        while let Some((path, include)) = next.take() {
-            if self.stop.load(Ordering::Acquire) || paths.len() >= budget { break; }
-            if self.allowed(&path) {
-                if let Ok(meta) = fs::symlink_metadata(&path) {
-                    let is_dir = if meta.is_symlink() { path.is_dir() } else { meta.is_dir() };
-                    if include { paths.push((path.to_string_lossy().into_owned(), is_dir)); }
-                    if is_dir && !meta.is_symlink() {
-                        // Watch before enumeration so concurrent changes remain queued.
-                        self.add_watch(&path);
-                        if let Ok(entries) = fs::read_dir(&path) { stack.push(entries); }
-                    }
-                }
+        let mut queue: VecDeque<PathBuf> = VecDeque::new();
+        if self.allowed(path) {
+            if let Ok(meta) = fs::symlink_metadata(path) {
+                let is_dir = if meta.is_symlink() { path.is_dir() } else { meta.is_dir() };
+                if include_self { paths.push((path.to_string_lossy().into_owned(), is_dir)); }
+                if is_dir && !meta.is_symlink() { queue.push_back(path.to_path_buf()); }
             }
-            while let Some(entries) = stack.last_mut() {
-                match entries.next() {
-                    Some(Ok(entry)) => { next = Some((entry.path(), true)); break; }
-                    Some(Err(_)) => {}
-                    None => { stack.pop(); }
+        }
+        while let Some(dir) = queue.pop_front() {
+            if self.stop.load(Ordering::Acquire) || paths.len() >= budget { break; }
+            self.add_watch(&dir);
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let mut taken = 0usize;
+            for entry in entries {
+                if self.stop.load(Ordering::Acquire) || paths.len() >= budget { break; }
+                let Ok(entry) = entry else { continue };
+                let child = entry.path();
+                if !self.allowed(&child) { continue; }
+                if taken >= self.dir_limit {
+                    log(&format!("index keeps the first {} entries of {}", self.dir_limit, dir.display()));
+                    break;
                 }
-                if self.stop.load(Ordering::Acquire) { break; }
+                let Ok(kind) = entry.file_type() else { continue };
+                let is_dir = if kind.is_symlink() { child.is_dir() } else { kind.is_dir() };
+                taken += 1;
+                paths.push((child.to_string_lossy().into_owned(), is_dir));
+                if kind.is_dir() { queue.push_back(child); }
             }
         }
         paths
@@ -834,5 +850,45 @@ mod tests {
         let mut all = index.best_components("/h/a", false, 10);
         all.sort();
         assert_eq!(all, vec!["b.d".to_string(), "b/".to_string(), "b-c/".to_string(), "b0".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pattern_excludes_match_prefixes() {
+        assert!(name_matches("out_*", std::ffi::OsStr::new("out_sm8635")));
+        assert!(!name_matches("out_*", std::ffi::OsStr::new("outside")));
+        assert!(path_matches(".config/google-chrome*", Path::new(".config/google-chrome-headless/Default")));
+        assert!(!path_matches(".config/google-chrome*", Path::new(".config/gtk-3.0")));
+    }
+
+    #[test]
+    fn scan_is_breadth_first_and_limits_directory_entries() {
+        let root = TempRoot::new();
+        fs::create_dir_all(root.0.join("aaa/deep/deeper")).unwrap();
+        for n in 0..30 { fs::write(root.0.join("aaa/deep/deeper").join(format!("f{n}")), b"").unwrap(); }
+        fs::create_dir(root.0.join("zzz")).unwrap();
+        fs::write(root.0.join(".dotfile"), b"").unwrap();
+        let mut live = LiveIndex::new(root.config(8), "", Arc::new(AtomicBool::new(false))).unwrap();
+        let index = live.rebuild().unwrap();
+        for name in ["aaa", "zzz", ".dotfile", "aaa/deep"] {
+            assert!(index.contains(root.0.join(name).to_str().unwrap()), "{name} missing");
+        }
+        let mut config = root.config(1000);
+        config.scan.max_dir_entries = 5;
+        let mut live = LiveIndex::new(config, "", Arc::new(AtomicBool::new(false))).unwrap();
+        let index = live.rebuild().unwrap();
+        let in_deeper = index.paths.iter().filter(|(p, _)| p.contains("/deeper/")).count();
+        assert_eq!(in_deeper, 5);
+    }
+
+    #[test]
+    fn builtin_excludes_hide_build_output_and_browser_profiles() {
+        let root = TempRoot::new();
+        fs::create_dir_all(root.0.join("proj/out_dev/x")).unwrap();
+        fs::create_dir_all(root.0.join(".config/google-chrome/Default")).unwrap();
+        fs::create_dir_all(root.0.join("proj/src")).unwrap();
+        let mut live = LiveIndex::new(root.config(1000), "", Arc::new(AtomicBool::new(false))).unwrap();
+        let index = live.rebuild().unwrap();
+        assert!(index.contains(root.0.join("proj/src").to_str().unwrap()));
+        assert!(!index.paths.iter().any(|(p, _)| p.contains("out_dev") || p.contains("google-chrome")));
     }
 }

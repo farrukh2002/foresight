@@ -54,6 +54,7 @@ pub struct ScanConfig {
     pub exclude_paths: Vec<String>,
     pub normal_mode_exclude_names: Vec<String>,
     pub normal_mode_exclude_paths: Vec<String>,
+    pub max_dir_entries: usize,
 }
 
 impl Default for ScanConfig {
@@ -74,9 +75,23 @@ impl Default for ScanConfig {
             ]),
             normal_mode_exclude_names: vec![],
             normal_mode_exclude_paths: strs(&["Android", "go", "flutter"]),
+            max_dir_entries: 4000,
         }
     }
 }
+
+const BUILTIN_EXCLUDE_NAMES: &[&str] = &[
+    "out", "out_*", "out-*", ".next", ".turbo", "Crashpad", "Service Worker", "IndexedDB",
+    "Local Storage", "Session Storage", "blob_storage", "CacheStorage", "ShaderCache",
+    "GrShaderCache", "DawnCache", "component_crx_cache",
+];
+
+const BUILTIN_EXCLUDE_PATHS: &[&str] = &[
+    ".config/google-chrome*", ".config/BraveSoftware", ".config/chromium",
+    ".config/microsoft-edge", ".config/Code", ".config/Cursor", ".config/Antigravity",
+    ".config/t3code*", ".config/Codex", ".config/mozilla", ".mozilla", ".var",
+    ".local/share/Trash", ".bun/install/cache",
+];
 
 fn strs(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
@@ -115,6 +130,12 @@ normal_mode_exclude_names = []
 
 # extra paths skipped only in normal mode
 normal_mode_exclude_paths = ["Android", "go", "flutter"]
+
+# most entries indexed from one directory; larger directories are cut off
+max_dir_entries = 4000
+
+# build output (out, out_*), browser profiles and editor data are always skipped;
+# a trailing * in a name or path component matches any suffix
 
 [train]
 # lines from one shell session arriving closer together than this are treated
@@ -190,6 +211,8 @@ impl Config {
             names.extend(self.scan.normal_mode_exclude_names.iter().cloned());
             paths.extend(self.scan.normal_mode_exclude_paths.iter().cloned());
         }
+        names.extend(strs(BUILTIN_EXCLUDE_NAMES));
+        paths.extend(strs(BUILTIN_EXCLUDE_PATHS));
         (names, paths)
     }
 
