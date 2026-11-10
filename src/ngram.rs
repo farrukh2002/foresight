@@ -16,7 +16,8 @@ const LEGACY_MAGIC3: &[u8; 4] = b"BPM3";
 
 const HALF_LIFE_DAYS: f64 = 14.0;
 const CWD_BONUS: f64 = 2.0;
-const SESSION_LINE_BONUS: f64 = 2.0;
+const SESSION_LINE_BONUS: f64 = 0.6;
+pub const SESSION_MIN_WORD_LEN: usize = 4;
 const BURST_CLUSTER_GAP_SECS: u64 = 30;
 const BURST_CLUSTER_MIN_LINES: usize = 8;
 const BURST_CLUSTER_MIN_COUNT: u32 = 3;
@@ -315,7 +316,20 @@ impl Model {
         ('\0', String::new())
     }
 
-    fn line_score(&self, entry: &LineEntry, cwd: &str, now: u64, seq: f64, session_words: Option<&HashSet<u32>>) -> f64 {
+    fn session_argument_match(&self, entry: &LineEntry, partial: &str, session_words: &HashSet<u32>) -> bool {
+        let Some(cut) = partial.rfind(char::is_whitespace).map(|i| i + 1) else { return false };
+        if command_word(&entry.text) != command_word(partial) || is_path_shaped(&last_shell_word(partial)) {
+            return false;
+        }
+        let Some(rest) = entry.text.get(cut..) else { return false };
+        rest.split_whitespace()
+            .take_while(|w| !matches!(*w, "&&" | "||" | ";" | "|"))
+            .filter(|w| w.len() >= SESSION_MIN_WORD_LEN && !w.starts_with('-'))
+            .filter_map(|w| self.vocab.get(w))
+            .any(|id| session_words.contains(&id))
+    }
+
+    fn line_score(&self, entry: &LineEntry, partial: &str, cwd: &str, now: u64, seq: f64, session_words: Option<&HashSet<u32>>) -> f64 {
         let mut score = entry.weight * recency_weight(entry.last_used, now);
         if seq > 0.0 {
             score *= 1.0 + SEQ_BONUS * (seq / (1.0 + seq));
@@ -323,12 +337,8 @@ impl Model {
         if !cwd.is_empty() && entry.cwd_counts.keys().any(|c| cwd == c || cwd.starts_with(&format!("{c}/")) || c.starts_with(&format!("{cwd}/"))) {
             score += CWD_BONUS;
         }
-        // A candidate reusing an argument from earlier in this session (the
-        // branch you checked out, the pod you inspected) is what the user is
-        // most plausibly about to type again. Multiplicative so the edge
-        // survives large histories where global vote counts grow.
         if let Some(sw) = session_words {
-            if entry.text.split_whitespace().filter_map(|w| self.vocab.get(w)).any(|id| sw.contains(&id)) {
+            if self.session_argument_match(entry, partial, sw) {
                 score *= 1.0 + SESSION_LINE_BONUS;
             }
         }
@@ -351,7 +361,7 @@ impl Model {
                 continue;
             }
             let seq = prev_shape.map_or(0.0, |p| self.seq_strength(p, entry.shape, now));
-            scored.push((self.line_score(entry, cwd, now, seq, session_words), entry.text.as_str()));
+            scored.push((self.line_score(entry, partial, cwd, now, seq, session_words), entry.text.as_str()));
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(b.1)));
         scored.truncate(k);
@@ -1718,6 +1728,40 @@ mod tests {
         let miss = m.accept_boost("never-trained", now);
         assert!(!miss);
         assert!(!m.line_index.contains_key("never-trained"), "accept_boost must not create entries");
+    }
+
+    #[test]
+    fn session_boost_never_overrides_a_short_common_command() {
+        let mut m = Model::default();
+        let mut now = 1_000u64;
+        for _ in 0..3 { m.train("clear", "/h", "/p", now); now += 1; }
+        m.train("curl -sL https://grep.app/api/search", "/h", "/p", now); now += 1;
+        let session: HashSet<u32> = std::iter::once(m.vocab.get("https://grep.app/api/search").unwrap()).collect();
+        let (_, suffix) = m.predict_with_session("c", "/p", now, true, None, Some(&session));
+        assert_eq!(suffix, "lear");
+    }
+
+    #[test]
+    fn session_boost_requires_the_same_command_word() {
+        let mut m = Model::default();
+        let mut now = 1_000u64;
+        for _ in 0..2 { m.train("git push origin main", "/h", "/p", now); now += 1; }
+        m.train("git pull origin feature/auth", "/h", "/p", now); now += 1;
+        m.train("docker push registry/feature-image", "/h", "/p", now); now += 1;
+        let session: HashSet<u32> = std::iter::once(m.vocab.get("registry/feature-image").unwrap()).collect();
+        let (_, suffix) = m.predict_with_session("git pu", "/p", now, true, None, Some(&session));
+        assert_eq!(suffix, "sh origin main");
+    }
+
+    #[test]
+    fn session_boost_ignores_words_after_a_shell_operator() {
+        let mut m = Model::default();
+        let mut now = 1_000u64;
+        for _ in 0..2 { m.train("make build", "/h", "/p", now); now += 1; }
+        m.train("make test && deploy staging-cluster", "/h", "/p", now); now += 1;
+        let session: HashSet<u32> = std::iter::once(m.vocab.get("staging-cluster").unwrap()).collect();
+        let (_, suffix) = m.predict_with_session("make ", "/p", now, true, None, Some(&session));
+        assert_eq!(suffix, "build");
     }
 
     #[test]

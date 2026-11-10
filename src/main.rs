@@ -27,6 +27,8 @@ use protocol::{Reply, Request, Response};
 use util::{data_dir, escape_path_suffix, expand_home, is_path_shaped, last_shell_word, log, now_millis, now_secs, wants_dirs};
 
 const SESSION_GAP_SECS: u64 = 1800;
+const SESSION_WORD_TTL_SECS: u64 = 600;
+const SESSION_RECENT_LINES: usize = 4;
 
 fn sock_path() -> PathBuf {
     env::var_os("FORESIGHT_SOCK").map(PathBuf::from).unwrap_or_else(|| data_dir().join("foresight.sock"))
@@ -61,16 +63,13 @@ struct AppState {
 }
 
 #[derive(Default, Clone)]
-struct SessionTail { last_shape: u64, last_time: u64, recent: Vec<String>, last_train_ms: u64, burst_until_ms: u64 }
+struct SessionTail { last_shape: u64, last_time: u64, recent: Vec<(u64, String)>, last_train_ms: u64, burst_until_ms: u64 }
 
-/// Argument tokens (skipping the leading verb, len >= 4) from the session's
-/// last lines, mapped to vocab ids. These carry the signal "the user already
-/// picked this branch/pod/path value earlier in this session".
 fn session_word_ids(model: &Model, recent: &[String]) -> Option<std::collections::HashSet<u32>> {
     if recent.is_empty() { return None; }
     let ids: std::collections::HashSet<u32> = recent.iter()
         .flat_map(|line| line.split_whitespace().skip(1))
-        .filter(|w| w.len() >= 4)
+        .filter(|w| w.len() >= ngram::SESSION_MIN_WORD_LEN && !w.starts_with('-'))
         .filter_map(|w| model.vocab.get(w))
         .collect();
     (!ids.is_empty()).then_some(ids)
@@ -397,7 +396,7 @@ fn session_recent(state: &AppState, session: &str, now: u64) -> Vec<String> {
     let sessions = state.sessions.lock();
     sessions.get(session)
         .filter(|t| now.saturating_sub(t.last_time) <= SESSION_GAP_SECS)
-        .map(|t| t.recent.clone())
+        .map(|t| t.recent.iter().filter(|(at, _)| now.saturating_sub(*at) <= SESSION_WORD_TTL_SECS).map(|(_, line)| line.clone()).collect())
         .unwrap_or_default()
 }
 fn scripted_input(state: &AppState, session: &str, now_ms: u64) -> bool {
@@ -417,8 +416,8 @@ fn session_advance(state: &AppState, session: &str, shape: u64, now: u64, line: 
     let prev = if now.saturating_sub(tail.last_time) <= SESSION_GAP_SECS && tail.last_shape != 0 { Some(tail.last_shape) } else { None };
     tail.last_shape = shape;
     tail.last_time = now;
-    tail.recent.push(line.to_owned());
-    if tail.recent.len() > 8 { tail.recent.remove(0); }
+    tail.recent.push((now, line.to_owned()));
+    if tail.recent.len() > SESSION_RECENT_LINES { tail.recent.remove(0); }
     prev
 }
 
