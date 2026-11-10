@@ -248,3 +248,15 @@ fn relative_directory_with_trailing_slash_completes_a_child_not_a_slash() {
     assert!(reply == "P:alpha/" || reply == "P:beta/", "{reply}");
     home.stop();
 }
+
+#[test]
+fn directory_prediction_ranks_children_by_usage_beyond_the_first_alphabetical_ones() {
+    let mut home = Home::new();
+    fs::create_dir_all(home.path.join("Documents/GitHub")).unwrap();
+    for n in 0..300 { fs::write(home.path.join(format!("Documents/GitHub/file-{n:03}")), b"").unwrap(); }
+    fs::create_dir_all(home.path.join("Documents/kernel-builder/kernel")).unwrap();
+    home.start();
+    for _ in 0..4 { assert_eq!(home.request("T", "ls Documents/kernel-builder/kernel")["Ok"], "OK"); }
+    assert_eq!(home.request("P", "cd Documents/")["Ok"], "P:kernel-builder/");
+    home.stop();
+}

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,18 +17,25 @@ use crate::util::write_snapshot;
 
 const MAGIC: &[u8; 4] = b"BPFS";
 
-const CAND_LIMIT: usize = 4096;
+const CAND_LIMIT: usize = 20000;
 static SCAN_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 
 pub struct FsIndex {
     pub paths: Vec<(String, bool)>,
     pub(crate) usage: Vec<f64>,
     pub usage_version: u64,
+    subtree: HashMap<String, f64>,
+}
+
+struct Child {
+    name: String,
+    is_dir: bool,
+    score: f64,
 }
 
 impl FsIndex {
     pub fn empty() -> FsIndex {
-        FsIndex { paths: Vec::new(), usage: Vec::new(), usage_version: 0 }
+        FsIndex { paths: Vec::new(), usage: Vec::new(), usage_version: 0, subtree: HashMap::new() }
     }
 
 
@@ -138,124 +145,104 @@ impl FsIndex {
         for p in model.path_freq.keys() {
             self.set_usage(p, model.path_score(p, now));
         }
+        self.rebuild_subtree();
         self.usage_version = version;
+    }
+
+    fn rebuild_subtree(&mut self) {
+        let mut subtree: HashMap<String, f64> = HashMap::new();
+        for (i, &score) in self.usage.iter().enumerate() {
+            if score <= 0.0 { continue; }
+            let mut path = self.paths[i].0.as_str();
+            loop {
+                *subtree.entry(path.to_string()).or_insert(0.0) += score;
+                match path.rfind('/') {
+                    Some(0) | None => break,
+                    Some(cut) => path = &path[..cut],
+                }
+            }
+        }
+        self.subtree = subtree;
+    }
+
+    fn children(&self, abs_prefix: &str, dirs_only: bool) -> Vec<Child> {
+        let mut out = Vec::new();
+        let mut pending: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut key = String::new();
+        let mut i = self.paths.partition_point(|(p, _)| p.as_str() < abs_prefix);
+        while i < self.paths.len() {
+            if let Some(end) = pending.remove(&i) {
+                i = end;
+                continue;
+            }
+            let (p, is_dir) = &self.paths[i];
+            if !p.starts_with(abs_prefix) { break; }
+            if out.len() >= CAND_LIMIT {
+                if !SCAN_LIMIT_WARNED.swap(true, Ordering::Relaxed) {
+                    log(&format!("path prediction examined {CAND_LIMIT} children - result may be partial"));
+                }
+                break;
+            }
+            let suffix = &p[abs_prefix.len()..];
+            if suffix.is_empty() {
+                i += 1;
+                continue;
+            }
+            let comp_end = suffix.find('/').unwrap_or(suffix.len());
+            let name = &suffix[..comp_end];
+            key.clear();
+            key.push_str(abs_prefix);
+            key.push_str(name);
+            let own = comp_end == suffix.len();
+            let sub_lo = format!("{key}/");
+            let sub_hi = format!("{key}0");
+            let base = i + usize::from(own);
+            let sub_start = base + self.paths[base..].partition_point(|(q, _)| q.as_str() < sub_lo.as_str());
+            let sub_end = sub_start + self.paths[sub_start..].partition_point(|(q, _)| q.as_str() < sub_hi.as_str());
+            let has_sub = sub_end > sub_start;
+            if has_sub && own {
+                pending.insert(sub_start, sub_end);
+            }
+            let dir = (own && *is_dir) || has_sub;
+            if !dirs_only || dir {
+                let own_score = if own { self.usage.get(i).copied().unwrap_or(0.0) } else { 0.0 };
+                let score = own_score.max(self.subtree.get(key.as_str()).copied().unwrap_or(0.0));
+                out.push(Child { name: name.to_string(), is_dir: dir, score });
+            }
+            i = if own { i + 1 } else { sub_end.max(i + 1) };
+        }
+        out.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        out
     }
 
     pub fn best_components(&self, abs_prefix: &str, dirs_only: bool, k: usize) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-
         if let Ok(i) = self.paths.binary_search_by(|(p, _)| p.as_str().cmp(abs_prefix))
             && self.paths[i].1
         {
             out.push("/".to_string());
-            if k <= 1 {
-                return out;
-            }
         }
-
-        let start = self.paths.partition_point(|(p, _)| p.as_str() < abs_prefix);
-        let mut best: Vec<(String, String, f64, usize)> = Vec::new();
-        let mut scanned = 0usize;
-        for (j, (p, is_dir)) in self.paths[start..].iter().enumerate() {
-            if !p.starts_with(abs_prefix) {
-                break;
-            }
-            scanned += 1;
-            if scanned > CAND_LIMIT {
-                if !SCAN_LIMIT_WARNED.swap(true, Ordering::Relaxed) {
-                    log(&format!("path prediction scan capped at {CAND_LIMIT} candidates - result may be partial"));
-                }
-                break;
-            }
-            if p == abs_prefix {
-                continue;
-            }
-            if dirs_only && !is_dir {
-                continue;
-            }
-            let suffix = &p[abs_prefix.len()..];
-            let comp_end = suffix.find('/').unwrap_or(suffix.len());
-            let name = &suffix[..comp_end];
-            let display = if name.is_empty() {
+        for child in self.children(abs_prefix, dirs_only) {
+            if out.len() >= k { break; }
+            let display = if child.name.is_empty() {
+                if out.iter().any(|d| d == "/") { continue; }
                 "/".to_string()
-            } else if comp_end == suffix.len() && *is_dir {
-                format!("{name}/")
+            } else if child.is_dir {
+                format!("{}/", child.name)
             } else {
-                name.to_string()
+                child.name
             };
-            let score = self.usage.get(start + j).copied().unwrap_or(0.0);
-            match best.iter().position(|(n, _, _, _)| n == name) {
-                Some(i) => {
-                    let e = &mut best[i];
-                    let wins = score > e.2 || (score == e.2 && p.len() < e.3);
-                    if wins {
-                        e.1 = display;
-                        e.2 = score;
-                        e.3 = p.len();
-                    } else if e.1 == *name && display.ends_with('/') {
-                        e.1 = display;
-                    }
-                }
-                None => best.push((name.to_string(), display, score, p.len())),
-            }
-        }
-
-        best.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then_with(|| a.3.cmp(&b.3)));
-        for (name, display, _, _) in best {
-            if out.len() >= k {
-                break;
-            }
-            if name.is_empty() && out.iter().any(|d| d == "/") {
-                continue;
-            }
             out.push(display);
         }
         out
     }
 
     pub fn predict(&self, abs_prefix: &str, dirs_only: bool) -> Option<String> {
-        if let Ok(i) = self.paths.binary_search_by(|(p, _)| p.as_str().cmp(abs_prefix)) {
-            if self.paths[i].1 {
-                return Some("/".to_string());
-            }
-        }
-        let start = self.paths.partition_point(|(p, _)| p.as_str() < abs_prefix);
-        let mut best: Option<(f64, usize)> = None;
-        let mut scanned = 0usize;
-        for (j, (p, is_dir)) in self.paths[start..].iter().enumerate() {
-            if !p.starts_with(abs_prefix) {
-                break;
-            }
-            scanned += 1;
-            if scanned > CAND_LIMIT {
-                if !SCAN_LIMIT_WARNED.swap(true, Ordering::Relaxed) {
-                    log(&format!("path prediction scan capped at {CAND_LIMIT} candidates - result may be partial"));
-                }
-                break;
-            }
-            if p == abs_prefix || (dirs_only && !is_dir) {
-                continue;
-            }
-            let score = self.usage.get(start + j).copied().unwrap_or(0.0);
-            let better = match best {
-                None => true,
-                Some((bs, bi)) => score > bs || (score == bs && p.len() < self.paths[bi].0.len()),
-            };
-            if better {
-                best = Some((score, start + j));
-            }
-        }
-        let idx = best.map(|(_, i)| i)?;
-        let (p, is_dir) = &self.paths[idx];
-        let suffix = &p[abs_prefix.len()..];
-        let comp_end = suffix.find('/').unwrap_or(suffix.len());
-        if suffix.is_empty() {
-            None
-        } else if comp_end == suffix.len() && *is_dir {
-            Some(format!("{}/", &suffix[..comp_end]))
-        } else {
-            Some(suffix[..comp_end].to_string())
-        }
+        self.best_components(abs_prefix, dirs_only, 1).pop()
     }
 
     #[cfg(test)]
@@ -334,7 +321,7 @@ impl FsIndex {
             prev = s;
         }
 
-        Ok(FsIndex { paths, usage: Vec::new(), usage_version: 0 })
+        Ok(FsIndex { paths, usage: Vec::new(), usage_version: 0, subtree: HashMap::new() })
     }
 }
 
@@ -575,7 +562,7 @@ mod tests {
         let mut paths: Vec<(String, bool)> = paths.iter().map(|(p, d)| (p.to_string(), *d)).collect();
         paths.sort();
         let n = paths.len();
-        FsIndex { paths, usage: vec![0.0; n], usage_version: 0 }
+        FsIndex { paths, usage: vec![0.0; n], usage_version: 0, subtree: HashMap::new() }
     }
 
     struct TempRoot(PathBuf);
@@ -819,5 +806,33 @@ mod tests {
         assert!(!index.contains("/h/a"));
         assert!(!index.contains("/h/a/b"));
         assert!(index.contains("/h/c"));
+    }
+
+    #[test]
+    fn child_ranking_uses_subtree_usage_not_alphabetical_order() {
+        let mut paths: Vec<(String, bool)> = vec![("/h/Documents/GitHub".into(), true), ("/h/Documents/kernel-builder".into(), true)];
+        for n in 0..6000 {
+            paths.push((format!("/h/Documents/GitHub/r{n:05}"), false));
+        }
+        paths.push(("/h/Documents/kernel-builder/kernel".into(), true));
+        paths.push(("/h/Documents/kernel-builder/kernel/main.c".into(), false));
+        paths.sort();
+        let n = paths.len();
+        let mut index = FsIndex { paths, usage: vec![0.0; n], usage_version: 0, subtree: HashMap::new() };
+        index.set_usage("/h/Documents/kernel-builder/kernel", 9.0);
+        index.rebuild_subtree();
+        assert_eq!(index.predict("/h/Documents/", true), Some("kernel-builder/".to_string()));
+        assert_eq!(index.best_components("/h/Documents/", true, 2), vec!["kernel-builder/".to_string(), "GitHub/".to_string()]);
+    }
+
+    #[test]
+    fn children_skip_subtrees_with_sibling_names_sorting_before_slash() {
+        let index = idx(&[
+            ("/h/ab", true), ("/h/ab-c", true), ("/h/ab-c/x", false), ("/h/ab.d", false),
+            ("/h/ab/deep", true), ("/h/ab/deep/f", false), ("/h/ab0", false),
+        ]);
+        let mut all = index.best_components("/h/a", false, 10);
+        all.sort();
+        assert_eq!(all, vec!["b.d".to_string(), "b/".to_string(), "b-c/".to_string(), "b0".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
     }
 }
