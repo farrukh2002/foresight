@@ -546,15 +546,48 @@ fn index_predictions(state: &AppState, model: &Model, cwd: &str, partial: &str, 
     candidates.into_iter().filter_map(|suffix| escape_path_suffix(partial, &suffix).map(|suffix| format!("P:{suffix}"))).collect()
 }
 
+fn path_prefix_ends(suffix: &str) -> (usize, Option<usize>) {
+    let mut escaped = false;
+    let mut component = None;
+    for (i, c) in suffix.char_indices() {
+        if escaped { escaped = false; continue; }
+        match c {
+            '\\' => escaped = true,
+            '/' if component.is_none() => component = Some(i + 1),
+            c if c.is_whitespace() => return (i, component),
+            _ => {}
+        }
+    }
+    (suffix.len(), component)
+}
+
+fn history_path_reply(state: &AppState, cwd: &str, partial: &str, suffix: &str) -> Option<String> {
+    if suffix.starts_with(char::is_whitespace) { return Some(format!("L:{suffix}")); }
+    let (word_end, component_end) = path_prefix_ends(suffix);
+    let exists = |piece: &str| {
+        let candidate = format!("{partial}{piece}");
+        expand_home(&last_shell_word(&candidate), &state.home, Some(cwd)).is_some_and(|abs| std::path::Path::new(&abs).exists())
+    };
+    [Some(word_end), component_end].into_iter().flatten()
+        .filter(|&end| end > 0)
+        .map(|end| &suffix[..end])
+        .find(|piece| exists(piece))
+        .map(|piece| format!("L:{piece}"))
+}
+
 fn combined_predict(state: &AppState, cwd: &str, partial: &str, prev_shape: Option<u64>, recent: &[String]) -> String {
     let now = now_secs();
     let model = state.model.lock();
     let session_words = session_word_ids(&model, recent);
     let explicit = is_path_shaped(&last_shell_word(partial));
-    if explicit {
+    let (tag, suffix) = model.predict_with_session(partial, cwd, now, !explicit, prev_shape, session_words.as_ref());
+    let dirs_arg = wants_dirs(partial.split_whitespace().next().unwrap_or("")) && partial.contains(char::is_whitespace);
+    if tag == 'L' && (explicit || dirs_arg) {
+        if let Some(reply) = history_path_reply(state, cwd, partial, &suffix) { return reply; }
+    }
+    if explicit || dirs_arg {
         if let Some(path) = index_predictions(state, &model, cwd, partial, now, 1).pop() { return path; }
     }
-    let (tag, suffix) = model.predict_with_session(partial, cwd, now, !explicit, prev_shape, session_words.as_ref());
     if tag != '\0' && (tag != 'F' || explicit) { return format!("{tag}:{suffix}"); }
     if let Some(path) = index_predictions(state, &model, cwd, partial, now, 1).pop() { return path; }
     if tag == '\0' { String::new() } else { format!("{tag}:{suffix}") }

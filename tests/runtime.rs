@@ -250,6 +250,33 @@ fn relative_directory_with_trailing_slash_completes_a_child_not_a_slash() {
 }
 
 #[test]
+fn history_decides_which_existing_child_directory_is_completed() {
+    let mut home = Home::new();
+    fs::create_dir_all(home.path.join("docs/alpha")).unwrap();
+    fs::create_dir_all(home.path.join("docs/beta")).unwrap();
+    home.start();
+    for _ in 0..3 { assert_eq!(home.request("T", "cd docs/beta/ && make")["Ok"], "OK"); }
+    assert_eq!(home.request("T", "cd docs/alpha/")["Ok"], "OK");
+    assert_eq!(home.request("P", "cd docs/")["Ok"], "L:beta/");
+    assert_eq!(home.request("P", "cd doc")["Ok"], "L:s/beta/");
+    assert_eq!(home.request("P", "cd docs/beta/")["Ok"], "L: && make");
+    home.stop();
+}
+
+#[test]
+fn bare_first_directory_word_completes_from_the_index() {
+    let mut home = Home::new();
+    fs::create_dir_all(home.path.join("pagebook/src")).unwrap();
+    fs::create_dir_all(home.path.join("zebra")).unwrap();
+    home.start();
+    assert_eq!(home.request("P", "cd pageb")["Ok"], "P:ook/");
+    assert_eq!(home.request("P", "cd ze")["Ok"], "P:bra/");
+    assert_eq!(home.request("T", "cd pagebook")["Ok"], "OK");
+    assert_eq!(home.request("P", "cd pa")["Ok"], "L:gebook");
+    home.stop();
+}
+
+#[test]
 fn directory_prediction_ranks_children_by_usage_beyond_the_first_alphabetical_ones() {
     let mut home = Home::new();
     fs::create_dir_all(home.path.join("Documents/GitHub")).unwrap();
