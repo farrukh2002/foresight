@@ -18,6 +18,7 @@ use crate::util::write_snapshot;
 const MAGIC: &[u8; 4] = b"BPFS";
 
 const CAND_LIMIT: usize = 20000;
+const SMALL_BATCH: usize = 16;
 static SCAN_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 
 pub struct FsIndex {
@@ -60,6 +61,22 @@ impl FsIndex {
         insert.sort();
         insert.dedup_by(|a, b| a.0 == b.0);
         let ranges = Self::removal_ranges(&self.paths, &remove);
+        if insert.len() + ranges.len() <= SMALL_BATCH {
+            for &(start, end) in ranges.iter().rev() {
+                self.paths.drain(start..end);
+                self.usage.drain(start..end);
+            }
+            for entry in insert {
+                match self.paths.binary_search_by(|(p, _)| p.as_str().cmp(entry.0.as_str())) {
+                    Ok(i) => self.paths[i] = entry,
+                    Err(i) => {
+                        self.paths.insert(i, entry);
+                        self.usage.insert(i, 0.0);
+                    }
+                }
+            }
+            return;
+        }
         let capacity = self.paths.len() + insert.len();
         let old = std::mem::take(&mut self.paths);
         let scores = std::mem::take(&mut self.usage);
@@ -830,6 +847,24 @@ mod tests {
         assert_eq!(index.usage.len(), index.paths.len());
         assert!(!index.contains("/h/a"));
         assert!(index.contains("/h/z000"));
+    }
+
+    #[test]
+    fn small_and_large_batches_produce_identical_indexes() {
+        let base: Vec<(&str, bool)> = (0..40).map(|n| (Box::leak(format!("/h/p{n:02}").into_boxed_str()) as &str, n % 3 == 0)).collect();
+        let mut small = idx(&base);
+        let mut large = idx(&base);
+        small.set_usage("/h/p05", 2.0);
+        large.set_usage("/h/p05", 2.0);
+        let insert = vec![("/h/p05/x".to_string(), false), ("/h/new".to_string(), true), ("/h/p07".to_string(), true)];
+        let remove = vec!["/h/p10".to_string(), "/h/p20".to_string()];
+        small.apply_batch(insert.clone(), remove.clone());
+        let mut padded = insert;
+        padded.extend((0..64).map(|n| (format!("/h/zz{n:02}"), false)));
+        large.apply_batch(padded, remove);
+        large.apply_batch(vec![], (0..64).map(|n| format!("/h/zz{n:02}")).collect());
+        assert_eq!(small.paths, large.paths);
+        assert_eq!(small.usage, large.usage);
     }
 
     #[test]
