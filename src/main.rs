@@ -620,6 +620,10 @@ fn client_request(kind: &str, cwd: &str, payload: &str) -> Response {
     let mut connection = match Connection::connect() {
         Ok(connection) => connection,
         Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+            if matches!(kind, "P" | "PL" | "E") {
+                spawn_daemon_detached()?;
+                return Err("daemon is starting".into());
+            }
             spawn_daemon_and_wait()?;
             Connection::connect().map_err(|e| e.to_string())?
         }
@@ -635,10 +639,14 @@ fn notify_running(kind: &str) -> Result<(), String> {
         Err(e) => Err(e.to_string()),
     }
 }
-fn spawn_daemon_and_wait() -> Result<(), String> {
+fn spawn_daemon_detached() -> Result<(), String> {
     Command::new(env::current_exe().map_err(|e| e.to_string())?).arg("serve")
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0)
         .spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn spawn_daemon_and_wait() -> Result<(), String> {
+    spawn_daemon_detached()?;
     for _ in 0..100 {
         thread::sleep(Duration::from_millis(50));
         if let Ok(mut connection) = Connection::connect() {
