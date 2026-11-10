@@ -48,6 +48,8 @@ struct AppState {
     // Admission and persistence share one lock: no training can be acknowledged
     // between the shutdown flush and closing admission.
     mutations: Mutex<()>,
+    persist: Mutex<()>,
+    flushing: [AtomicBool; 2],
     stopping: AtomicBool,
     exit_ready: AtomicBool,
     reload: Mutex<u64>,
@@ -203,22 +205,35 @@ fn acquire_singleton_lock() -> io::Result<Option<std::fs::File>> {
 }
 
 fn flush_model(state: &AppState) -> Result<(), String> {
-    if state.dirty.load(Ordering::Acquire) {
-        state.model.lock().save(&model_path()).map_err(|e| {
-            let message = format!("model persistence failed: {e}");
-            log(&message);
-            message
-        })?;
-        state.dirty.store(false, Ordering::Release);
-    }
-    Ok(())
+    let _persist = state.persist.lock();
+    let bytes = {
+        let model = state.model.lock();
+        if !state.dirty.swap(false, Ordering::AcqRel) { return Ok(()); }
+        model.encode()
+    };
+    bytes.and_then(|bytes| util::write_snapshot(&model_path(), &bytes)).map_err(|e| {
+        state.dirty.store(true, Ordering::Release);
+        let message = format!("model persistence failed: {e}");
+        log(&message);
+        message
+    })
 }
 fn flush_index(state: &AppState) -> Result<(), String> {
-    state.fsindex.lock().save(&fsindex_path()).map_err(|e| {
+    let _persist = state.persist.lock();
+    let bytes = state.fsindex.lock().encode();
+    bytes.and_then(|bytes| util::write_snapshot(&fsindex_path(), &bytes)).map_err(|e| {
         let message = format!("filesystem index persistence failed: {e}");
         log(&message);
         message
     })
+}
+fn flush_in_background(state: &Arc<AppState>, index: bool) {
+    if state.flushing[usize::from(index)].swap(true, Ordering::AcqRel) { return; }
+    let state = state.clone();
+    thread::spawn(move || {
+        let _ = if index { flush_index(&state) } else { flush_model(&state) };
+        state.flushing[usize::from(index)].store(false, Ordering::Release);
+    });
 }
 fn shutdown(state: &AppState) -> Result<(), String> {
     let _guard = state.mutations.lock();
@@ -242,6 +257,7 @@ fn serve() -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(data_dir(), std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     let Some(_singleton) = acquire_singleton_lock().map_err(|e| e.to_string())? else { return Ok(()); };
+    util::remove_stale_temp_files(&data_dir());
     let home = env::var("HOME").map_err(|e| e.to_string())?;
     let mut model = Model::load(&model_path()).unwrap_or_else(|e| {
         log(&format!("model.bin unreadable ({e}), starting fresh"));
@@ -256,7 +272,7 @@ fn serve() -> Result<(), String> {
     let state = Arc::new(AppState {
         model: Mutex::new(model),
         fsindex: Arc::new(Mutex::new(FsIndex::load(&fsindex_path()).unwrap_or_else(|_| FsIndex::empty()))),
-        watcher: Mutex::new(None), home, dirty: AtomicBool::new(true), mutations: Mutex::new(()),
+        watcher: Mutex::new(None), home, dirty: AtomicBool::new(true), mutations: Mutex::new(()), persist: Mutex::new(()), flushing: [AtomicBool::new(false), AtomicBool::new(false)],
         stopping: AtomicBool::new(false), exit_ready: AtomicBool::new(false),
         reload: Mutex::new(0), wake: Condvar::new(), sessions: Mutex::new(HashMap::new()),
         predicts: AtomicU64::new(0), accepts: AtomicU64::new(0),
@@ -288,12 +304,11 @@ fn serve() -> Result<(), String> {
             Err(e) => { log(&format!("socket accept failed: {e}")); thread::sleep(Duration::from_millis(100)); }
         }
         if last_flush.elapsed() >= Duration::from_secs(2) {
-            let _guard = state.mutations.lock();
-            let _ = flush_model(&state);
+            flush_in_background(&state, false);
             last_flush = std::time::Instant::now();
         }
         if last_index_flush.elapsed() >= Duration::from_secs(300) {
-            let _ = flush_index(&state);
+            flush_in_background(&state, true);
             last_index_flush = std::time::Instant::now();
         }
     }

@@ -299,6 +299,22 @@ pub fn atomic_write(
     Ok(())
 }
 
+pub fn write_snapshot(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, |w| w.write_all(bytes))
+}
+
+pub fn remove_stale_temp_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix('.').and_then(|n| n.split_once(".tmp.")).map(|(_, r)| r.to_owned()) else { continue };
+        let Some(pid) = rest.split('.').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 pub fn fnv1a64(data: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -320,6 +336,20 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_temp_files_of_dead_processes_are_removed() {
+        let dir = std::env::temp_dir().join(format!("foresight-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = dir.join(".model.bin.tmp.4294967.123.0");
+        let mine = dir.join(format!(".model.bin.tmp.{}.123.0", std::process::id()));
+        let other = dir.join("model.bin");
+        for f in [&dead, &mine, &other] { std::fs::write(f, b"x").unwrap(); }
+        remove_stale_temp_files(&dir);
+        assert!(!dead.exists());
+        assert!(mine.exists() && other.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn lexical_normalize_collapses_dots() {

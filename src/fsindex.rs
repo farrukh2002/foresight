@@ -11,7 +11,9 @@ use parking_lot::Mutex;
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
 use crate::config::Config;
-use crate::util::{atomic_write, data_dir, fnv1a64, log};
+use crate::util::{data_dir, fnv1a64, log};
+#[cfg(test)]
+use crate::util::write_snapshot;
 
 const MAGIC: &[u8; 4] = b"BPFS";
 
@@ -256,7 +258,12 @@ impl FsIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        write_snapshot(path, &self.encode()?)
+    }
+
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut body = Vec::new();
         body.write_all(&(self.paths.len() as u32).to_le_bytes())?;
 
@@ -279,11 +286,11 @@ impl FsIndex {
         }
 
         let checksum = fnv1a64(&body);
-        atomic_write(path, |w| {
-            w.write_all(MAGIC)?;
-            w.write_all(&body)?;
-            w.write_all(&checksum.to_le_bytes())
-        })
+        let mut out = Vec::with_capacity(MAGIC.len() + body.len() + 8);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        Ok(out)
     }
 
     pub fn load(path: &Path) -> io::Result<FsIndex> {
