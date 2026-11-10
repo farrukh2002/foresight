@@ -165,6 +165,32 @@ impl FsIndex {
         self.subtree = subtree;
     }
 
+    pub fn evict_to(&mut self, cap: usize, protect: &[String]) {
+        if self.paths.len() <= cap { return; }
+        let protect = if protect.len() > cap / 2 { &[][..] } else { protect };
+        self.usage.resize(self.paths.len(), 0.0);
+        let target = cap - cap / 20;
+        let wanted = self.paths.len() - target;
+        let mut order: Vec<usize> = (0..self.paths.len())
+            .filter(|&i| protect.is_empty() || protect.binary_search_by(|p| p.as_str().cmp(self.paths[i].0.as_str())).is_err())
+            .collect();
+        let wanted = wanted.min(order.len());
+        if wanted == 0 { return; }
+        let depth = |i: usize| self.paths[i].0.bytes().filter(|&b| b == b'/').count();
+        order.select_nth_unstable_by(wanted - 1, |&a, &b| {
+            self.usage[a].partial_cmp(&self.usage[b]).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| depth(b).cmp(&depth(a)))
+                .then_with(|| b.cmp(&a))
+        });
+        let mut drop = vec![false; self.paths.len()];
+        for &i in &order[..wanted] { drop[i] = true; }
+        let mut n = 0;
+        self.paths.retain(|_| { let keep = !drop[n]; n += 1; keep });
+        let mut n = 0;
+        self.usage.retain(|_| { let keep = !drop[n]; n += 1; keep });
+        self.usage_version = u64::MAX;
+    }
+
     fn children(&self, abs_prefix: &str, dirs_only: bool) -> Vec<Child> {
         let mut out = Vec::new();
         let mut pending: BTreeMap<usize, usize> = BTreeMap::new();
@@ -541,9 +567,10 @@ impl LiveIndex {
             // One merge for the entire kernel batch. Metadata reflects the final
             // filesystem state, so delete/recreate and recreate/delete both work.
             let mut idx = index.lock();
+            let mut protect: Vec<String> = insert.iter().map(|(p, _)| p.clone()).collect();
             idx.apply_batch(insert, remove);
-            idx.paths.truncate(self.cap);
-            idx.usage.truncate(self.cap);
+            protect.sort();
+            idx.evict_to(self.cap, &protect);
             idx.usage_version = u64::MAX;
         }
     }
@@ -559,13 +586,19 @@ impl LiveIndex {
         let budget = {
             let mut idx = index.lock();
             idx.apply_batch(vec![], vec![path.to_string_lossy().into_owned()]);
-            self.cap.saturating_sub(idx.paths.len())
+            self.cap.saturating_sub(idx.paths.len()).max(self.cap / 20)
         };
         let include = !self.roots.iter().any(|root| root == path);
         let entries = self.scan(path, include, budget);
         let mut idx = index.lock();
+        let mut protect: Vec<String> = if idx.paths.len() + entries.len() > self.cap {
+            entries.iter().map(|(p, _)| p.clone()).collect()
+        } else {
+            Vec::new()
+        };
         idx.apply_batch(entries, vec![]);
-        // New entries must receive current model usage on the next prediction.
+        protect.sort();
+        idx.evict_to(self.cap, &protect);
         idx.usage_version = u64::MAX;
     }
 }
@@ -850,6 +883,16 @@ mod tests {
         let mut all = index.best_components("/h/a", false, 10);
         all.sort();
         assert_eq!(all, vec!["b.d".to_string(), "b/".to_string(), "b-c/".to_string(), "b0".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn eviction_keeps_used_and_protected_paths() {
+        let mut index = idx(&[("/h/a", false), ("/h/b", false), ("/h/c/d/e", false), ("/h/z", false)]);
+        index.set_usage("/h/z", 4.0);
+        index.evict_to(2, &["/h/b".to_string()]);
+        let kept: Vec<&str> = index.paths.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(kept, vec!["/h/b", "/h/z"]);
+        assert_eq!(index.usage.len(), 2);
     }
 
     #[test]
