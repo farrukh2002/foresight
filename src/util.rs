@@ -49,7 +49,11 @@ pub fn expand_home(token: &str, home: &str, cwd: Option<&str>) -> Option<String>
         None
     } else {
         let cwd = cwd?;
-        Some(lexical_normalize(&Path::new(cwd).join(token)).to_string_lossy().to_string())
+        let mut abs = lexical_normalize(&Path::new(cwd).join(token)).to_string_lossy().to_string();
+        if token.ends_with('/') && !abs.ends_with('/') {
+            abs.push('/');
+        }
+        Some(abs)
     }
 }
 

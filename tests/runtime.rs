@@ -237,3 +237,14 @@ fn scripted_bursts_and_agent_noise_are_not_learned() {
     assert_eq!(home.request("P", "head -n 1000 >> ")["Ok"], "");
     home.stop();
 }
+
+#[test]
+fn relative_directory_with_trailing_slash_completes_a_child_not_a_slash() {
+    let mut home = Home::new();
+    fs::create_dir_all(home.path.join("docs/alpha")).unwrap();
+    fs::create_dir_all(home.path.join("docs/beta")).unwrap();
+    home.start();
+    let reply = home.request("P", "cd docs/")["Ok"].as_str().unwrap().to_string();
+    assert!(reply == "P:alpha/" || reply == "P:beta/", "{reply}");
+    home.stop();
+}
