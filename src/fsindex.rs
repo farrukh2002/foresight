@@ -380,6 +380,32 @@ fn path_matches(pattern: &str, rel: &Path) -> bool {
     pattern.split('/').all(|want| parts.next().is_some_and(|got| name_matches(want, got.as_os_str())))
 }
 
+pub fn live_children(abs_prefix: &str, dirs_only: bool, limit: usize, score: impl Fn(&str) -> f64) -> Vec<String> {
+    let (dir, base) = match abs_prefix.rfind('/') {
+        Some(cut) => (if cut == 0 { "/" } else { &abs_prefix[..cut] }, &abs_prefix[cut + 1..]),
+        None => return Vec::new(),
+    };
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<(f64, String, bool)> = Vec::new();
+    for entry in entries.take(limit).flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(base) || name == base { continue; }
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir() || (t.is_symlink() && entry.path().is_dir()));
+        if dirs_only && !is_dir { continue; }
+        let full = Path::new(dir).join(&name).to_string_lossy().into_owned();
+        found.push((score(&full), name, is_dir));
+    }
+    found.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.len().cmp(&b.1.len()))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    found.into_iter().map(|(_, name, is_dir)| {
+        let rest = &name[base.len()..];
+        if is_dir { format!("{rest}/") } else { rest.to_string() }
+    }).collect()
+}
+
 fn common_prefix_len(a: &str, b: &str) -> usize {
     let mut n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     while !a.is_char_boundary(n) {
@@ -968,5 +994,16 @@ mod tests {
         let index = live.rebuild().unwrap();
         assert!(index.contains(root.0.join("proj/src").to_str().unwrap()));
         assert!(!index.paths.iter().any(|(p, _)| p.contains("out_dev") || p.contains("google-chrome")));
+    }
+
+    #[test]
+    fn live_children_lists_unindexed_directory_entries() {
+        let root = TempRoot::new();
+        fs::create_dir(root.0.join("pagebook")).unwrap();
+        fs::write(root.0.join("pagefile"), b"").unwrap();
+        let prefix = root.0.join("page").to_string_lossy().into_owned();
+        assert_eq!(live_children(&prefix, true, 100, |_| 0.0), vec!["book/".to_string()]);
+        let both = live_children(&prefix, false, 100, |p| if p.ends_with("pagefile") { 1.0 } else { 0.0 });
+        assert_eq!(both, vec!["file".to_string(), "book/".to_string()]);
     }
 }

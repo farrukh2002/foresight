@@ -536,8 +536,13 @@ fn index_predictions(state: &AppState, model: &Model, cwd: &str, partial: &str, 
     let mut idx = state.fsindex.lock();
     if idx.usage_version != model.version { idx.refresh_usage(model, now, model.version); }
     let cmd = partial.split_whitespace().next().unwrap_or("");
-    let candidates = if count == 1 { idx.predict(&abs, wants_dirs(cmd)).into_iter().collect() }
+    let mut candidates: Vec<String> = if count == 1 { idx.predict(&abs, wants_dirs(cmd)).into_iter().collect() }
         else { idx.best_components(&abs, wants_dirs(cmd), count) };
+    drop(idx);
+    if candidates.is_empty() {
+        candidates = fsindex::live_children(&abs, wants_dirs(cmd), 4000, |p| model.path_score(p, now));
+        candidates.truncate(count);
+    }
     candidates.into_iter().filter_map(|suffix| escape_path_suffix(partial, &suffix).map(|suffix| format!("P:{suffix}"))).collect()
 }
 
