@@ -593,15 +593,23 @@ fn combined_predict(state: &AppState, cwd: &str, partial: &str, prev_shape: Opti
     if tag == '\0' { String::new() } else { format!("{tag}:{suffix}") }
 }
 
+fn read_timeout(kind: &str) -> Duration {
+    match kind {
+        "P" | "PL" | "E" | "PING" => Duration::from_secs(2),
+        "T" | "A" => Duration::from_secs(5),
+        _ => Duration::from_secs(60),
+    }
+}
+
 struct Connection { reader: BufReader<UnixStream> }
 impl Connection {
     fn connect() -> io::Result<Self> {
         let stream = UnixStream::connect(sock_path())?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         Ok(Self { reader: BufReader::new(stream) })
     }
     fn request(&mut self, kind: &str, cwd: &str, payload: &str) -> io::Result<Response> {
+        self.reader.get_ref().set_read_timeout(Some(read_timeout(kind)))?;
         let request = Request { kind: kind.into(), cwd: cwd.into(), payload: payload.into(), session: env::var("FORESIGHT_SESSION").unwrap_or_default() };
         protocol::write_json(self.reader.get_mut(), &request)?;
         protocol::read_json(&mut self.reader)
